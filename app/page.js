@@ -8,12 +8,13 @@ const RATE_UNLOCK_SECONDS = 30;
 
 const AVATAR_PALETTE = ["#FF3D7F", "#5EEAD4", "#FFB454", "#8C7CF0", "#4ADE80", "#F5C24D", "#60A5FA", "#F97316", "#EC4899", "#34D399"];
 
+function randomAvatarId(gender) {
+  const g = gender === "female" ? "f" : "m";
+  return `${g}${1 + Math.floor(Math.random() * 10)}`;
+}
+
 function Avatar({ id, size = 36 }) {
-  if (!id) {
-    return (
-      <div style={{ width: size, height: size, borderRadius: "50%", background: "#232532", flexShrink: 0 }} />
-    );
-  }
+  if (!id) return <div style={{ width: size, height: size, borderRadius: "50%", background: "#232532", flexShrink: 0 }} />;
   const gender = id[0];
   const idx = (parseInt(id.slice(1), 10) - 1) % AVATAR_PALETTE.length;
   const bg = AVATAR_PALETTE[idx];
@@ -58,16 +59,16 @@ function pickSuggestions() {
 export default function Home() {
   const [uid, setUid] = useState(null);
   const [profile, setProfile] = useState(null);
-  const [screen, setScreen] = useState("loading"); // loading | landing | matching | chat | banned
+  const [screen, setScreen] = useState("loading"); // loading | landing | matching | chat | banned | friendChat
+  const [homeTab, setHomeTab] = useState("find"); // find | friends
   const [error, setError] = useState("");
 
-  // landing / signup form
+  // signup form
   const [username, setUsername] = useState("");
   const [gender, setGender] = useState("male");
-  const [avatarId, setAvatarId] = useState("m1");
   const [genderFilter, setGenderFilter] = useState("any");
 
-  // chat
+  // random-match chat
   const [sessionId, setSessionId] = useState(null);
   const [partner, setPartner] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -79,14 +80,21 @@ export default function Home() {
   const [ratingHover, setRatingHover] = useState(0);
   const [partnerLeft, setPartnerLeft] = useState(false);
   const [suggestions, setSuggestions] = useState([]);
+  const [matchFriendStatus, setMatchFriendStatus] = useState(null); // null | pending | accepted | already_friends
   const messagesEndRef = useRef(null);
 
-  const restrictedFromGender = profile && profile.rating < 2;
+  // friends
+  const [friendSearch, setFriendSearch] = useState("");
+  const [friendResults, setFriendResults] = useState([]);
+  const [incomingRequests, setIncomingRequests] = useState([]);
+  const [friendsList, setFriendsList] = useState([]);
+  const [friendChatId, setFriendChatId] = useState(null);
+  const [friendPartner, setFriendPartner] = useState(null);
+  const [friendMessages, setFriendMessages] = useState([]);
+  const [friendDraft, setFriendDraft] = useState("");
+  const friendMessagesEndRef = useRef(null);
 
-  function pickGender(g) {
-    setGender(g);
-    setAvatarId(`${g[0]}1`);
-  }
+  const restrictedFromGender = profile && profile.rating < 2;
 
   // -------------------------------------------------------------------
   // 1. Sign in anonymously the first time someone visits
@@ -95,23 +103,14 @@ export default function Home() {
     async function init() {
       const { data: sessionData } = await supabase.auth.getSession();
       let user = sessionData.session?.user;
-
       if (!user) {
         const { data, error } = await supabase.auth.signInAnonymously();
-        if (error) {
-          setError("Couldn't start a session: " + error.message);
-          return;
-        }
+        if (error) { setError("Couldn't start a session: " + error.message); return; }
         user = data.user;
       }
       setUid(user.id);
 
-      const { data: existingProfile } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", user.id)
-        .maybeSingle();
-
+      const { data: existingProfile } = await supabase.from("profiles").select("*").eq("id", user.id).maybeSingle();
       if (existingProfile) {
         setProfile(existingProfile);
         if (existingProfile.banned_until && new Date(existingProfile.banned_until) > new Date()) {
@@ -129,20 +128,16 @@ export default function Home() {
   // -------------------------------------------------------------------
   async function createProfileAndMatch() {
     setError("");
-    if (profile) {
-      await startMatching();
-      return;
-    }
+    if (profile) { await startMatching(); return; }
     if (!/^[a-zA-Z0-9._-]{3,20}$/.test(username)) {
       setError("Username: 3-20 characters, letters/numbers/dot/dash only.");
       return;
     }
     const { data, error } = await supabase
       .from("profiles")
-      .insert({ id: uid, username, gender, avatar_id: avatarId })
+      .insert({ id: uid, username, gender, avatar_id: randomAvatarId(gender) })
       .select()
       .single();
-
     if (error) {
       if (error.code === "23505") setError("That username is taken.");
       else setError(error.message);
@@ -153,17 +148,15 @@ export default function Home() {
   }
 
   // -------------------------------------------------------------------
-  // 3. Matching: check ban, spend coins if needed, then pair
+  // 3. Matching
   // -------------------------------------------------------------------
   async function startMatching(freshProfile) {
     setError("");
     const currentProfile = freshProfile || profile;
-
     if (currentProfile?.banned_until && new Date(currentProfile.banned_until) > new Date()) {
       setScreen("banned");
       return;
     }
-
     if (genderFilter !== "any") {
       if (currentProfile && currentProfile.rating < 2) {
         setError("Your rating is below 2★ — specific-gender matching is locked right now.");
@@ -173,47 +166,34 @@ export default function Home() {
         setError(`Not enough coins. A ${genderFilter} match costs ${GENDER_MATCH_COST} coins.`);
         return;
       }
-      const { data: newBalance, error: spendError } = await supabase.rpc("spend_coins", {
-        p_amount: GENDER_MATCH_COST,
-      });
+      const { data: newBalance, error: spendError } = await supabase.rpc("spend_coins", { p_amount: GENDER_MATCH_COST });
       if (spendError) {
         setError(`Not enough coins. A ${genderFilter} match costs ${GENDER_MATCH_COST} coins.`);
         return;
       }
       setProfile((p) => ({ ...p, coins: newBalance }));
     }
-
     setScreen("matching");
     const { data: newSessionId, error } = await supabase.rpc("find_match", {
       p_gender: currentProfile?.gender || gender,
       p_gender_filter: genderFilter,
     });
     if (error) {
-      if (error.message.includes("banned_until")) {
-        setScreen("banned");
-      } else {
-        setError(error.message);
-        setScreen("landing");
-      }
+      if (error.message.includes("banned_until")) setScreen("banned");
+      else { setError(error.message); setScreen("landing"); }
       return;
     }
-    if (newSessionId) {
-      await enterSession(newSessionId);
-    }
+    if (newSessionId) await enterSession(newSessionId);
   }
 
   useEffect(() => {
     if (screen !== "matching" || !uid) return;
     const channel = supabase
       .channel("waiting-for-match")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "chat_sessions" },
-        (payload) => {
-          const row = payload.new;
-          if (row.user_a === uid || row.user_b === uid) enterSession(row.id);
-        }
-      )
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "chat_sessions" }, (payload) => {
+        const row = payload.new;
+        if (row.user_a === uid || row.user_b === uid) enterSession(row.id);
+      })
       .subscribe();
     return () => supabase.removeChannel(channel);
   }, [screen, uid]);
@@ -223,7 +203,6 @@ export default function Home() {
     if (!session) return;
     const partnerId = session.user_a === uid ? session.user_b : session.user_a;
     const { data: partnerProfile } = await supabase.from("profiles").select("*").eq("id", partnerId).single();
-
     setSessionId(id);
     setPartner(partnerProfile);
     setMessages([]);
@@ -232,50 +211,34 @@ export default function Home() {
     setChatStartedAt(Date.now());
     setElapsed(0);
     setSuggestions(pickSuggestions());
+    setMatchFriendStatus(null);
     setScreen("chat");
   }
 
   // -------------------------------------------------------------------
-  // 4. Chat: realtime messages, the rating-unlock timer, and detecting
-  //    when the other person leaves or skips to someone new
+  // 4. Random chat: realtime messages, timer, leave detection
   // -------------------------------------------------------------------
   useEffect(() => {
     if (screen !== "chat" || !sessionId) return;
-
-    supabase
-      .from("messages")
-      .select("*")
-      .eq("session_id", sessionId)
-      .order("created_at", { ascending: true })
+    supabase.from("messages").select("*").eq("session_id", sessionId).order("created_at", { ascending: true })
       .then(({ data }) => setMessages(data || []));
 
     const messagesChannel = supabase
       .channel(`session-${sessionId}`)
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "messages", filter: `session_id=eq.${sessionId}` },
-        (payload) => {
-          setMessages((m) => [...m, payload.new]);
-          if (payload.new.sender_id !== uid) setStreak(0);
-        }
-      )
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: `session_id=eq.${sessionId}` }, (payload) => {
+        setMessages((m) => [...m, payload.new]);
+        if (payload.new.sender_id !== uid) setStreak(0);
+      })
       .subscribe();
 
     const sessionChannel = supabase
       .channel(`session-status-${sessionId}`)
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "chat_sessions", filter: `id=eq.${sessionId}` },
-        (payload) => {
-          if (payload.new.ended_at) setPartnerLeft(true);
-        }
-      )
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "chat_sessions", filter: `id=eq.${sessionId}` }, (payload) => {
+        if (payload.new.ended_at) setPartnerLeft(true);
+      })
       .subscribe();
 
-    return () => {
-      supabase.removeChannel(messagesChannel);
-      supabase.removeChannel(sessionChannel);
-    };
+    return () => { supabase.removeChannel(messagesChannel); supabase.removeChannel(sessionChannel); };
   }, [screen, sessionId, uid]);
 
   useEffect(() => {
@@ -284,19 +247,18 @@ export default function Home() {
     return () => clearInterval(id);
   }, [screen, chatStartedAt]);
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
   async function sendMessage() {
     if (!draft.trim() || streak >= 6 || partnerLeft) return;
-    const { error } = await supabase
-      .from("messages")
-      .insert({ session_id: sessionId, sender_id: uid, body: draft.trim() });
-    if (!error) {
-      setDraft("");
-      setStreak((s) => s + 1);
-    }
+    const { error } = await supabase.from("messages").insert({ session_id: sessionId, sender_id: uid, body: draft.trim() });
+    if (!error) { setDraft(""); setStreak((s) => s + 1); }
+  }
+
+  async function addFriendFromMatch() {
+    if (!partner) return;
+    const { data, error } = await supabase.rpc("send_friend_request", { p_recipient_id: partner.id });
+    if (!error) setMatchFriendStatus(data);
   }
 
   // -------------------------------------------------------------------
@@ -306,15 +268,11 @@ export default function Home() {
     if (elapsed >= RATE_UNLOCK_SECONDS) setShowRatingModal(true);
     else proceedNext();
   }
-
   async function proceedNext() {
     if (sessionId) await supabase.rpc("end_session", { p_session_id: sessionId });
-    setSessionId(null);
-    setPartner(null);
-    setShowRatingModal(false);
+    setSessionId(null); setPartner(null); setShowRatingModal(false);
     await startMatching();
   }
-
   async function submitRating(stars) {
     if (sessionId) {
       const { error } = await supabase.rpc("submit_rating", { p_session_id: sessionId, p_stars: stars });
@@ -326,17 +284,89 @@ export default function Home() {
   async function goHome() {
     if (sessionId) await supabase.rpc("end_session", { p_session_id: sessionId });
     if (screen === "matching") await supabase.rpc("leave_queue");
-    setSessionId(null);
-    setPartner(null);
+    setSessionId(null); setPartner(null);
+    setFriendChatId(null); setFriendPartner(null);
     setScreen("landing");
   }
 
   function timeRemaining(untilIso) {
     const ms = new Date(untilIso).getTime() - Date.now();
     if (ms <= 0) return "0h 0m";
-    const h = Math.floor(ms / 3600000);
-    const m = Math.floor((ms % 3600000) / 60000);
-    return `${h}h ${m}m`;
+    return `${Math.floor(ms / 3600000)}h ${Math.floor((ms % 3600000) / 60000)}m`;
+  }
+
+  // -------------------------------------------------------------------
+  // 6. Friends tab: search, requests, list
+  // -------------------------------------------------------------------
+  async function loadFriendsData() {
+    if (!uid) return;
+    const { data: incoming } = await supabase
+      .from("friend_requests")
+      .select("*, requester:requester_id(id, username, avatar_id)")
+      .eq("recipient_id", uid)
+      .eq("status", "pending");
+    setIncomingRequests(incoming || []);
+
+    const { data: chats } = await supabase
+      .from("friend_chats")
+      .select("*, a:user_a(id, username, avatar_id), b:user_b(id, username, avatar_id)")
+      .or(`user_a.eq.${uid},user_b.eq.${uid}`);
+    setFriendsList(
+      (chats || []).map((c) => ({ chatId: c.id, partner: c.user_a === uid ? c.b : c.a }))
+    );
+  }
+
+  useEffect(() => {
+    if (homeTab !== "friends" || screen !== "landing" || !uid) return;
+    loadFriendsData();
+    const ch1 = supabase.channel("friend-reqs-in").on("postgres_changes", { event: "*", schema: "public", table: "friend_requests", filter: `recipient_id=eq.${uid}` }, loadFriendsData).subscribe();
+    const ch2 = supabase.channel("friend-reqs-out").on("postgres_changes", { event: "*", schema: "public", table: "friend_requests", filter: `requester_id=eq.${uid}` }, loadFriendsData).subscribe();
+    return () => { supabase.removeChannel(ch1); supabase.removeChannel(ch2); };
+  }, [homeTab, screen, uid]);
+
+  async function searchUsers() {
+    const q = friendSearch.trim();
+    if (!q) { setFriendResults([]); return; }
+    const { data } = await supabase.from("profiles").select("id, username, avatar_id").ilike("username", `%${q}%`).neq("id", uid).limit(10);
+    setFriendResults(data || []);
+  }
+
+  async function sendRequestTo(recipientId) {
+    const { error } = await supabase.rpc("send_friend_request", { p_recipient_id: recipientId });
+    if (!error) { searchUsers(); loadFriendsData(); }
+  }
+
+  async function respondRequest(requestId, accept) {
+    await supabase.rpc("respond_to_friend_request", { p_request_id: requestId, p_accept: accept });
+    loadFriendsData();
+  }
+
+  async function openFriendChat(chatId, partnerProfile) {
+    setFriendChatId(chatId);
+    setFriendPartner(partnerProfile);
+    setFriendMessages([]);
+    setScreen("friendChat");
+  }
+
+  useEffect(() => {
+    if (screen !== "friendChat" || !friendChatId) return;
+    supabase.from("friend_messages").select("*").eq("chat_id", friendChatId).order("created_at", { ascending: true })
+      .then(({ data }) => setFriendMessages(data || []));
+    const channel = supabase
+      .channel(`friend-chat-${friendChatId}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "friend_messages", filter: `chat_id=eq.${friendChatId}` }, (payload) => {
+        setFriendMessages((m) => [...m, payload.new]);
+      })
+      .subscribe();
+    return () => supabase.removeChannel(channel);
+  }, [screen, friendChatId]);
+
+  useEffect(() => { friendMessagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [friendMessages]);
+
+  async function sendFriendMessage() {
+    if (!friendDraft.trim()) return;
+    const { error } = await supabase.from("friend_messages").insert({ chat_id: friendChatId, sender_id: uid, body: friendDraft.trim() });
+    if (!error) setFriendDraft("");
   }
 
   // -------------------------------------------------------------------
@@ -345,16 +375,13 @@ export default function Home() {
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
       <div className="w-full max-w-md rounded-2xl border border-[#2E3140] bg-[#1B1D26] overflow-hidden relative">
-        {screen === "loading" && (
-          <div className="p-10 text-center text-sm text-[#8C8FA3] font-mono">connecting…</div>
-        )}
+        {screen === "loading" && <div className="p-10 text-center text-sm text-[#8C8FA3] font-mono">connecting…</div>}
 
         {screen === "banned" && (
           <div className="p-10 text-center">
             <p className="font-display text-lg">Chat banned for 12 hours</p>
             <p className="text-xs text-[#8C8FA3] mt-2">
-              5 different people rated you below 2★. Time remaining:{" "}
-              {profile?.banned_until ? timeRemaining(profile.banned_until) : "—"}
+              5 different people rated you below 2★. Time remaining: {profile?.banned_until ? timeRemaining(profile.banned_until) : "—"}
             </p>
             <button
               onClick={async () => {
@@ -371,97 +398,122 @@ export default function Home() {
 
         {screen === "landing" && (
           <div className="p-6">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                {profile && <Avatar id={profile.avatar_id} size={38} />}
-                <p className="font-display text-2xl leading-tight">
-                  Tune in to<br />someone new.
-                </p>
-              </div>
-              <div className="flex flex-col gap-1.5 items-end shrink-0">
-                <div className="rounded-full px-3 py-1.5 bg-[#232532] text-xs font-mono whitespace-nowrap">
-                  🪙 {profile ? profile.coins : 50}
+            <div className="flex gap-4 mb-4 border-b border-[#2E3140]">
+              <button onClick={() => setHomeTab("find")} className="pb-2 text-sm font-mono" style={{ color: homeTab === "find" ? "#F0F0EE" : "#5C5F70", borderBottom: homeTab === "find" ? "2px solid #FF3D7F" : "2px solid transparent" }}>
+                Find New
+              </button>
+              <button onClick={() => setHomeTab("friends")} className="pb-2 text-sm font-mono flex items-center gap-1.5" style={{ color: homeTab === "friends" ? "#F0F0EE" : "#5C5F70", borderBottom: homeTab === "friends" ? "2px solid #FF3D7F" : "2px solid transparent" }}>
+                Friends {incomingRequests.length > 0 && <span className="rounded-full bg-[#FF3D7F] text-[#1A0810] text-[10px] px-1.5">{incomingRequests.length}</span>}
+              </button>
+            </div>
+
+            {homeTab === "find" && (
+              <>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    {profile && <Avatar id={profile.avatar_id} size={38} />}
+                    <p className="font-display text-2xl leading-tight">Tune in to<br />someone new.</p>
+                  </div>
+                  <div className="flex flex-col gap-1.5 items-end shrink-0">
+                    <div className="rounded-full px-3 py-1.5 bg-[#232532] text-xs font-mono whitespace-nowrap">🪙 {profile ? profile.coins : 50}</div>
+                    {profile && (
+                      <div className="rounded-full px-3 py-1.5 text-xs font-mono whitespace-nowrap" style={{ background: restrictedFromGender ? "#3A1E22" : "#232532" }}>
+                        ⭐ {Number(profile.rating).toFixed(1)}
+                      </div>
+                    )}
+                  </div>
                 </div>
-                {profile && (
-                  <div
-                    className="rounded-full px-3 py-1.5 text-xs font-mono whitespace-nowrap"
-                    style={{ background: restrictedFromGender ? "#3A1E22" : "#232532" }}
-                  >
-                    ⭐ {Number(profile.rating).toFixed(1)}
+
+                {!profile && (
+                  <div className="mt-5 flex flex-col gap-3">
+                    <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="Pick a username" className="rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none" />
+                    <div className="flex gap-2">
+                      <button onClick={() => setGender("male")} className={`flex-1 rounded-lg py-2 text-sm ${gender === "male" ? "bg-[#1E3D38] text-[#5EEAD4]" : "bg-[#232532] text-[#8C8FA3]"}`}>Male</button>
+                      <button onClick={() => setGender("female")} className={`flex-1 rounded-lg py-2 text-sm ${gender === "female" ? "bg-[#1E3D38] text-[#5EEAD4]" : "bg-[#232532] text-[#8C8FA3]"}`}>Female</button>
+                    </div>
+                    <p className="text-[10px] font-mono text-[#5C5F70]">Your avatar will be picked for you — you can change it later.</p>
                   </div>
                 )}
-              </div>
-            </div>
 
-            {!profile && (
-              <div className="mt-5 flex flex-col gap-3">
-                <input
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="Pick a username"
-                  className="rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none"
-                />
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => pickGender("male")}
-                    className={`flex-1 rounded-lg py-2 text-sm ${gender === "male" ? "bg-[#1E3D38] text-[#5EEAD4]" : "bg-[#232532] text-[#8C8FA3]"}`}
-                  >
-                    Male
-                  </button>
-                  <button
-                    onClick={() => pickGender("female")}
-                    className={`flex-1 rounded-lg py-2 text-sm ${gender === "female" ? "bg-[#1E3D38] text-[#5EEAD4]" : "bg-[#232532] text-[#8C8FA3]"}`}
-                  >
-                    Female
-                  </button>
+                <div className="mt-4">
+                  <p className="text-xs font-mono text-[#8C8FA3] mb-1.5">MATCH WITH</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    {["any", "male", "female"].map((g) => {
+                      const locked = g !== "any" && restrictedFromGender;
+                      return (
+                        <button key={g} onClick={() => !locked && setGenderFilter(g)} className={`rounded-lg py-2.5 flex flex-col items-center gap-0.5 ${genderFilter === g ? "bg-[#5A2438] text-[#FF3D7F]" : "bg-[#232532] text-[#8C8FA3]"}`} style={{ opacity: locked ? 0.5 : 1 }}>
+                          <span className="text-sm capitalize">{locked ? "🔒" : g}</span>
+                          <span className="text-[10px] font-mono opacity-70">{g === "any" ? "free" : locked ? "rating too low" : `${GENDER_MATCH_COST} coins`}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
 
-                <p className="text-[10px] font-mono text-[#5C5F70] mt-1">PICK YOUR AVATAR</p>
-                <div className="grid grid-cols-5 gap-2">
-                  {Array.from({ length: 10 }, (_, i) => `${gender[0]}${i + 1}`).map((id) => (
-                    <button
-                      key={id}
-                      onClick={() => setAvatarId(id)}
-                      className="rounded-full p-0.5"
-                      style={{ border: `2px solid ${avatarId === id ? "#FF3D7F" : "transparent"}` }}
-                    >
-                      <Avatar id={id} size={36} />
-                    </button>
-                  ))}
-                </div>
-              </div>
+                {error && <p className="text-xs font-mono text-[#FF5C5C] mt-3">{error}</p>}
+
+                <button onClick={createProfileAndMatch} className="w-full mt-5 rounded-xl py-3.5 font-display bg-[#FF3D7F] text-[#1A0810]">
+                  Start matching
+                </button>
+              </>
             )}
 
-            <div className="mt-4">
-              <p className="text-xs font-mono text-[#8C8FA3] mb-1.5">MATCH WITH</p>
-              <div className="grid grid-cols-3 gap-2">
-                {["any", "male", "female"].map((g) => {
-                  const locked = g !== "any" && restrictedFromGender;
-                  return (
-                    <button
-                      key={g}
-                      onClick={() => !locked && setGenderFilter(g)}
-                      className={`rounded-lg py-2.5 flex flex-col items-center gap-0.5 ${genderFilter === g ? "bg-[#5A2438] text-[#FF3D7F]" : "bg-[#232532] text-[#8C8FA3]"}`}
-                      style={{ opacity: locked ? 0.5 : 1 }}
-                    >
-                      <span className="text-sm capitalize">{locked ? "🔒" : g}</span>
-                      <span className="text-[10px] font-mono opacity-70">
-                        {g === "any" ? "free" : locked ? "rating too low" : `${GENDER_MATCH_COST} coins`}
-                      </span>
-                    </button>
-                  );
-                })}
+            {homeTab === "friends" && (
+              <div>
+                {!profile ? (
+                  <p className="text-sm text-[#8C8FA3]">Make a profile on the Find New tab first.</p>
+                ) : (
+                  <>
+                    <div className="flex gap-1.5">
+                      <input value={friendSearch} onChange={(e) => setFriendSearch(e.target.value)} onKeyDown={(e) => e.key === "Enter" && searchUsers()} placeholder="Find by username" className="flex-1 rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none" />
+                      <button onClick={searchUsers} className="rounded-lg px-3 bg-[#232532] text-xs font-mono">Search</button>
+                    </div>
+
+                    {friendResults.length > 0 && (
+                      <div className="mt-3 flex flex-col gap-1.5">
+                        {friendResults.map((u) => (
+                          <div key={u.id} className="flex items-center justify-between rounded-lg px-3 py-2 bg-[#232532]">
+                            <span className="flex items-center gap-2 text-sm"><Avatar id={u.avatar_id} size={26} /> {u.username}</span>
+                            <button onClick={() => sendRequestTo(u.id)} className="text-xs font-mono text-[#5EEAD4]">Add friend</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {incomingRequests.length > 0 && (
+                      <div className="mt-4">
+                        <p className="text-[10px] font-mono text-[#5C5F70] mb-1.5">FRIEND REQUESTS</p>
+                        <div className="flex flex-col gap-1.5">
+                          {incomingRequests.map((r) => (
+                            <div key={r.id} className="flex items-center justify-between rounded-lg px-3 py-2 bg-[#232532]">
+                              <span className="flex items-center gap-2 text-sm"><Avatar id={r.requester?.avatar_id} size={26} /> {r.requester?.username}</span>
+                              <div className="flex gap-2">
+                                <button onClick={() => respondRequest(r.id, false)} className="text-xs font-mono text-[#5C5F70]">Decline</button>
+                                <button onClick={() => respondRequest(r.id, true)} className="text-xs font-mono text-[#5EEAD4]">Accept</button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <p className="text-[10px] font-mono text-[#5C5F70] mt-4 mb-1.5">YOUR FRIENDS ({friendsList.length})</p>
+                    {friendsList.length === 0 ? (
+                      <p className="text-xs font-mono text-[#5C5F70]">No friends yet — search above, or add someone mid-chat.</p>
+                    ) : (
+                      <div className="flex flex-col gap-1.5">
+                        {friendsList.map((f) => (
+                          <button key={f.chatId} onClick={() => openFriendChat(f.chatId, f.partner)} className="flex items-center justify-between rounded-lg px-3 py-2.5 bg-[#232532]">
+                            <span className="flex items-center gap-2 text-sm"><Avatar id={f.partner?.avatar_id} size={28} /> {f.partner?.username}</span>
+                            <span className="text-[10px] font-mono text-[#5EEAD4]">Chat</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
-            </div>
-
-            {error && <p className="text-xs font-mono text-[#FF5C5C] mt-3">{error}</p>}
-
-            <button
-              onClick={createProfileAndMatch}
-              className="w-full mt-5 rounded-xl py-3.5 font-display bg-[#FF3D7F] text-[#1A0810]"
-            >
-              Start matching
-            </button>
+            )}
           </div>
         )}
 
@@ -469,9 +521,7 @@ export default function Home() {
           <div className="p-10 text-center">
             <p className="font-display text-lg">Scanning frequencies…</p>
             <p className="text-xs font-mono text-[#8C8FA3] mt-2">filter: {genderFilter}</p>
-            <button onClick={goHome} className="mt-6 text-xs font-mono text-[#8C8FA3] underline">
-              cancel
-            </button>
+            <button onClick={goHome} className="mt-6 text-xs font-mono text-[#8C8FA3] underline">cancel</button>
           </div>
         )}
 
@@ -479,100 +529,75 @@ export default function Home() {
           <div className="flex flex-col" style={{ height: 480 }}>
             <div className="px-5 py-3 flex items-center justify-between border-b border-[#2E3140]">
               <div className="flex items-center gap-2">
-                <button onClick={goHome} className="p-2 rounded-lg bg-[#232532] text-xs">
-                  home
-                </button>
+                <button onClick={goHome} className="p-2 rounded-lg bg-[#232532] text-xs">home</button>
                 <Avatar id={partner.avatar_id} size={32} />
                 <p className="font-display text-sm">{partner.username}</p>
               </div>
-              <button onClick={requestNext} className="p-2 rounded-lg bg-[#232532] text-xs">
-                next
-              </button>
+              <div className="flex items-center gap-2">
+                <button onClick={addFriendFromMatch} disabled={!!matchFriendStatus} className="p-2 rounded-lg bg-[#232532] text-xs">
+                  {matchFriendStatus === "accepted" || matchFriendStatus === "already_friends" ? "✓ friends" : matchFriendStatus === "pending" ? "requested" : "+ friend"}
+                </button>
+                <button onClick={requestNext} className="p-2 rounded-lg bg-[#232532] text-xs">next</button>
+              </div>
             </div>
 
-            <div
-              className="px-5 py-1.5 text-xs font-mono"
-              style={{
-                background: elapsed >= RATE_UNLOCK_SECONDS ? "#1E3D38" : "#232532",
-                color: elapsed >= RATE_UNLOCK_SECONDS ? "#5EEAD4" : "#5C5F70",
-              }}
-            >
-              {elapsed >= RATE_UNLOCK_SECONDS
-                ? "Rating unlocked for this chat"
-                : `Rating unlocks in ${RATE_UNLOCK_SECONDS - elapsed}s`}
+            <div className="px-5 py-1.5 text-xs font-mono" style={{ background: elapsed >= RATE_UNLOCK_SECONDS ? "#1E3D38" : "#232532", color: elapsed >= RATE_UNLOCK_SECONDS ? "#5EEAD4" : "#5C5F70" }}>
+              {elapsed >= RATE_UNLOCK_SECONDS ? "Rating unlocked for this chat" : `Rating unlocks in ${RATE_UNLOCK_SECONDS - elapsed}s`}
             </div>
 
             {partnerLeft && (
               <div className="px-5 py-2 text-xs font-mono bg-[#3A1E22] text-[#FF5C5C] flex items-center justify-between">
                 <span>{partner.username} has left the chat</span>
-                <button onClick={requestNext} className="underline shrink-0 ml-2">
-                  find next
-                </button>
+                <button onClick={requestNext} className="underline shrink-0 ml-2">find next</button>
               </div>
             )}
 
             <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-2">
               {messages.map((m) => (
-                <div
-                  key={m.id}
-                  className={`max-w-[75%] px-3 py-2 rounded-2xl text-sm ${
-                    m.sender_id === uid ? "self-end bg-[#FF3D7F] text-[#1A0810]" : "self-start bg-[#232532]"
-                  }`}
-                >
-                  {m.body}
-                </div>
+                <div key={m.id} className={`max-w-[75%] px-3 py-2 rounded-2xl text-sm ${m.sender_id === uid ? "self-end bg-[#FF3D7F] text-[#1A0810]" : "self-start bg-[#232532]"}`}>{m.body}</div>
               ))}
               <div ref={messagesEndRef} />
             </div>
 
-            {streak >= 6 && !partnerLeft && (
-              <div className="px-5 py-1.5 text-xs font-mono bg-[#3A1E22] text-[#FF5C5C]">
-                6 messages sent — wait for a reply
-              </div>
-            )}
+            {streak >= 6 && !partnerLeft && <div className="px-5 py-1.5 text-xs font-mono bg-[#3A1E22] text-[#FF5C5C]">6 messages sent — wait for a reply</div>}
 
             {messages.length < 3 && !partnerLeft && (
               <div className="px-4 pt-2">
                 <div className="flex items-center justify-between mb-1.5">
                   <span className="text-[10px] font-mono text-[#5C5F70]">NEED AN OPENER?</span>
-                  <button
-                    onClick={() => setSuggestions(pickSuggestions())}
-                    className="text-[10px] font-mono text-[#5EEAD4]"
-                  >
-                    shuffle
-                  </button>
+                  <button onClick={() => setSuggestions(pickSuggestions())} className="text-[10px] font-mono text-[#5EEAD4]">shuffle</button>
                 </div>
                 <div className="flex gap-1.5 overflow-x-auto pb-1">
                   {suggestions.map((s, i) => (
-                    <button
-                      key={i}
-                      onClick={() => setDraft(s)}
-                      className="shrink-0 rounded-full px-3 py-1.5 text-[11px] whitespace-nowrap bg-[#232532] border border-[#2E3140]"
-                      style={{ maxWidth: 220 }}
-                    >
-                      {s}
-                    </button>
+                    <button key={i} onClick={() => setDraft(s)} className="shrink-0 rounded-full px-3 py-1.5 text-[11px] whitespace-nowrap bg-[#232532] border border-[#2E3140]" style={{ maxWidth: 220 }}>{s}</button>
                   ))}
                 </div>
               </div>
             )}
 
             <div className="px-4 py-3 flex gap-2 border-t border-[#2E3140]">
-              <input
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-                disabled={streak >= 6 || partnerLeft}
-                placeholder={partnerLeft ? "They've left this chat" : "Type a message"}
-                className="flex-1 rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none"
-              />
-              <button
-                onClick={sendMessage}
-                disabled={streak >= 6 || partnerLeft}
-                className="px-4 rounded-lg bg-[#FF3D7F] text-[#1A0810] text-sm font-display"
-              >
-                Send
-              </button>
+              <input value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => e.key === "Enter" && sendMessage()} disabled={streak >= 6 || partnerLeft} placeholder={partnerLeft ? "They've left this chat" : "Type a message"} className="flex-1 rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none" />
+              <button onClick={sendMessage} disabled={streak >= 6 || partnerLeft} className="px-4 rounded-lg bg-[#FF3D7F] text-[#1A0810] text-sm font-display">Send</button>
+            </div>
+          </div>
+        )}
+
+        {screen === "friendChat" && friendPartner && (
+          <div className="flex flex-col" style={{ height: 480 }}>
+            <div className="px-5 py-3 flex items-center gap-2 border-b border-[#2E3140]">
+              <button onClick={goHome} className="p-2 rounded-lg bg-[#232532] text-xs">home</button>
+              <Avatar id={friendPartner.avatar_id} size={32} />
+              <p className="font-display text-sm">{friendPartner.username}</p>
+            </div>
+            <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-2">
+              {friendMessages.map((m) => (
+                <div key={m.id} className={`max-w-[75%] px-3 py-2 rounded-2xl text-sm ${m.sender_id === uid ? "self-end bg-[#FF3D7F] text-[#1A0810]" : "self-start bg-[#232532]"}`}>{m.body}</div>
+              ))}
+              <div ref={friendMessagesEndRef} />
+            </div>
+            <div className="px-4 py-3 flex gap-2 border-t border-[#2E3140]">
+              <input value={friendDraft} onChange={(e) => setFriendDraft(e.target.value)} onKeyDown={(e) => e.key === "Enter" && sendFriendMessage()} placeholder="Type a message" className="flex-1 rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none" />
+              <button onClick={sendFriendMessage} className="px-4 rounded-lg bg-[#FF3D7F] text-[#1A0810] text-sm font-display">Send</button>
             </div>
           </div>
         )}
@@ -588,12 +613,8 @@ export default function Home() {
                   </button>
                 ))}
               </div>
-              <p className="text-[11px] font-mono mt-3 text-[#5C5F70]">
-                5 low ratings (under 2★) from different people triggers a 12h ban.
-              </p>
-              <button onClick={proceedNext} className="mt-3 text-xs font-mono underline text-[#5C5F70]">
-                skip rating, go to next
-              </button>
+              <p className="text-[11px] font-mono mt-3 text-[#5C5F70]">5 low ratings (under 2★) from different people triggers a 12h ban.</p>
+              <button onClick={proceedNext} className="mt-3 text-xs font-mono underline text-[#5C5F70]">skip rating, go to next</button>
             </div>
           </div>
         )}
