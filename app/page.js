@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 
+const GENDER_MATCH_COST = 5;
+
 export default function Home() {
   const [uid, setUid] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -23,8 +25,7 @@ export default function Home() {
   const messagesEndRef = useRef(null);
 
   // -------------------------------------------------------------------
-  // 1. Sign in anonymously the first time someone visits — no email or
-  //    password needed. Supabase remembers this browser's session.
+  // 1. Sign in anonymously the first time someone visits
   // -------------------------------------------------------------------
   useEffect(() => {
     async function init() {
@@ -47,13 +48,8 @@ export default function Home() {
         .eq("id", user.id)
         .maybeSingle();
 
-      if (existingProfile) {
-        setProfile(existingProfile);
-        setGenderFilter("any");
-        setScreen("landing");
-      } else {
-        setScreen("landing"); // will show the username/gender form
-      }
+      if (existingProfile) setProfile(existingProfile);
+      setScreen("landing");
     }
     init();
   }, []);
@@ -83,18 +79,34 @@ export default function Home() {
       return;
     }
     setProfile(data);
-    await startMatching();
+    await startMatching(data);
   }
 
   // -------------------------------------------------------------------
-  // 3. Matching: ask the database to pair us with someone, then wait.
-  //    Realtime subscription catches it the instant someone else pairs
-  //    with us, so no constant polling is needed.
+  // 3. Matching: spend coins if needed, then ask the database to pair us
   // -------------------------------------------------------------------
-  async function startMatching() {
+  async function startMatching(freshProfile) {
+    setError("");
+    const currentProfile = freshProfile || profile;
+
+    if (genderFilter !== "any") {
+      if ((currentProfile?.coins ?? 0) < GENDER_MATCH_COST) {
+        setError(`Not enough coins. A ${genderFilter} match costs ${GENDER_MATCH_COST} coins.`);
+        return;
+      }
+      const { data: newBalance, error: spendError } = await supabase.rpc("spend_coins", {
+        p_amount: GENDER_MATCH_COST,
+      });
+      if (spendError) {
+        setError(`Not enough coins. A ${genderFilter} match costs ${GENDER_MATCH_COST} coins.`);
+        return;
+      }
+      setProfile((p) => ({ ...p, coins: newBalance }));
+    }
+
     setScreen("matching");
     const { data: newSessionId, error } = await supabase.rpc("find_match", {
-      p_gender: profile?.gender || gender,
+      p_gender: currentProfile?.gender || gender,
       p_gender_filter: genderFilter,
     });
     if (error) {
@@ -105,8 +117,8 @@ export default function Home() {
     if (newSessionId) {
       await enterSession(newSessionId);
     }
-    // if null, we're now in the queue — the subscription below will
-    // fire once someone else pairs with us
+    // if null, we're now in the queue — the subscription below catches
+    // it once someone else pairs with us
   }
 
   useEffect(() => {
@@ -219,7 +231,12 @@ export default function Home() {
 
         {screen === "landing" && (
           <div className="p-6">
-            <p className="font-display text-2xl">Tune in to<br />someone new.</p>
+            <div className="flex items-center justify-between">
+              <p className="font-display text-2xl">Tune in to<br />someone new.</p>
+              <div className="rounded-full px-3 py-1.5 bg-[#232532] text-xs font-mono whitespace-nowrap">
+                🪙 {profile ? profile.coins : 50}
+              </div>
+            </div>
 
             {!profile && (
               <div className="mt-5 flex flex-col gap-3">
@@ -253,9 +270,12 @@ export default function Home() {
                   <button
                     key={g}
                     onClick={() => setGenderFilter(g)}
-                    className={`rounded-lg py-2 text-sm capitalize ${genderFilter === g ? "bg-[#5A2438] text-[#FF3D7F]" : "bg-[#232532] text-[#8C8FA3]"}`}
+                    className={`rounded-lg py-2.5 flex flex-col items-center gap-0.5 ${genderFilter === g ? "bg-[#5A2438] text-[#FF3D7F]" : "bg-[#232532] text-[#8C8FA3]"}`}
                   >
-                    {g}
+                    <span className="text-sm capitalize">{g}</span>
+                    <span className="text-[10px] font-mono opacity-70">
+                      {g === "any" ? "free" : `${GENDER_MATCH_COST} coins`}
+                    </span>
                   </button>
                 ))}
               </div>
