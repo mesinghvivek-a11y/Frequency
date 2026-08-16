@@ -4,11 +4,12 @@ import { useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 
 const GENDER_MATCH_COST = 5;
+const RATE_UNLOCK_SECONDS = 30;
 
 export default function Home() {
   const [uid, setUid] = useState(null);
   const [profile, setProfile] = useState(null);
-  const [screen, setScreen] = useState("loading"); // loading | landing | matching | chat
+  const [screen, setScreen] = useState("loading"); // loading | landing | matching | chat | banned
   const [error, setError] = useState("");
 
   // landing form
@@ -22,7 +23,13 @@ export default function Home() {
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
   const [streak, setStreak] = useState(0);
+  const [chatStartedAt, setChatStartedAt] = useState(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [showRatingModal, setShowRatingModal] = useState(false);
+  const [ratingHover, setRatingHover] = useState(0);
   const messagesEndRef = useRef(null);
+
+  const restrictedFromGender = profile && profile.rating < 2;
 
   // -------------------------------------------------------------------
   // 1. Sign in anonymously the first time someone visits
@@ -48,7 +55,13 @@ export default function Home() {
         .eq("id", user.id)
         .maybeSingle();
 
-      if (existingProfile) setProfile(existingProfile);
+      if (existingProfile) {
+        setProfile(existingProfile);
+        if (existingProfile.banned_until && new Date(existingProfile.banned_until) > new Date()) {
+          setScreen("banned");
+          return;
+        }
+      }
       setScreen("landing");
     }
     init();
@@ -83,13 +96,22 @@ export default function Home() {
   }
 
   // -------------------------------------------------------------------
-  // 3. Matching: spend coins if needed, then ask the database to pair us
+  // 3. Matching: check ban, spend coins if needed, then pair
   // -------------------------------------------------------------------
   async function startMatching(freshProfile) {
     setError("");
     const currentProfile = freshProfile || profile;
 
+    if (currentProfile?.banned_until && new Date(currentProfile.banned_until) > new Date()) {
+      setScreen("banned");
+      return;
+    }
+
     if (genderFilter !== "any") {
+      if (currentProfile && currentProfile.rating < 2) {
+        setError("Your rating is below 2★ — specific-gender matching is locked right now.");
+        return;
+      }
       if ((currentProfile?.coins ?? 0) < GENDER_MATCH_COST) {
         setError(`Not enough coins. A ${genderFilter} match costs ${GENDER_MATCH_COST} coins.`);
         return;
@@ -110,15 +132,17 @@ export default function Home() {
       p_gender_filter: genderFilter,
     });
     if (error) {
-      setError(error.message);
-      setScreen("landing");
+      if (error.message.includes("banned_until")) {
+        setScreen("banned");
+      } else {
+        setError(error.message);
+        setScreen("landing");
+      }
       return;
     }
     if (newSessionId) {
       await enterSession(newSessionId);
     }
-    // if null, we're now in the queue — the subscription below catches
-    // it once someone else pairs with us
   }
 
   useEffect(() => {
@@ -130,9 +154,7 @@ export default function Home() {
         { event: "INSERT", schema: "public", table: "chat_sessions" },
         (payload) => {
           const row = payload.new;
-          if (row.user_a === uid || row.user_b === uid) {
-            enterSession(row.id);
-          }
+          if (row.user_a === uid || row.user_b === uid) enterSession(row.id);
         }
       )
       .subscribe();
@@ -140,28 +162,22 @@ export default function Home() {
   }, [screen, uid]);
 
   async function enterSession(id) {
-    const { data: session } = await supabase
-      .from("chat_sessions")
-      .select("*")
-      .eq("id", id)
-      .single();
+    const { data: session } = await supabase.from("chat_sessions").select("*").eq("id", id).single();
     if (!session) return;
     const partnerId = session.user_a === uid ? session.user_b : session.user_a;
-    const { data: partnerProfile } = await supabase
-      .from("profiles")
-      .select("*")
-      .eq("id", partnerId)
-      .single();
+    const { data: partnerProfile } = await supabase.from("profiles").select("*").eq("id", partnerId).single();
 
     setSessionId(id);
     setPartner(partnerProfile);
     setMessages([]);
     setStreak(0);
+    setChatStartedAt(Date.now());
+    setElapsed(0);
     setScreen("chat");
   }
 
   // -------------------------------------------------------------------
-  // 4. Chat: subscribe to new messages for this session in real time
+  // 4. Chat: realtime messages + the rating-unlock timer
   // -------------------------------------------------------------------
   useEffect(() => {
     if (screen !== "chat" || !sessionId) return;
@@ -188,27 +204,48 @@ export default function Home() {
   }, [screen, sessionId, uid]);
 
   useEffect(() => {
+    if (screen !== "chat" || !chatStartedAt) return;
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - chatStartedAt) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [screen, chatStartedAt]);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   async function sendMessage() {
     if (!draft.trim() || streak >= 6) return;
-    const { error } = await supabase.from("messages").insert({
-      session_id: sessionId,
-      sender_id: uid,
-      body: draft.trim(),
-    });
+    const { error } = await supabase
+      .from("messages")
+      .insert({ session_id: sessionId, sender_id: uid, body: draft.trim() });
     if (!error) {
       setDraft("");
       setStreak((s) => s + 1);
     }
   }
 
-  async function nextPerson() {
+  // -------------------------------------------------------------------
+  // 5. Next / rating
+  // -------------------------------------------------------------------
+  function requestNext() {
+    if (elapsed >= RATE_UNLOCK_SECONDS) setShowRatingModal(true);
+    else proceedNext();
+  }
+
+  async function proceedNext() {
     if (sessionId) await supabase.rpc("end_session", { p_session_id: sessionId });
     setSessionId(null);
     setPartner(null);
+    setShowRatingModal(false);
     await startMatching();
+  }
+
+  async function submitRating(stars) {
+    if (sessionId) {
+      const { error } = await supabase.rpc("submit_rating", { p_session_id: sessionId, p_stars: stars });
+      if (!error) setProfile((p) => ({ ...p, coins: Math.min(50, p.coins + 1) }));
+    }
+    await proceedNext();
   }
 
   async function goHome() {
@@ -219,22 +256,62 @@ export default function Home() {
     setScreen("landing");
   }
 
+  function timeRemaining(untilIso) {
+    const ms = new Date(untilIso).getTime() - Date.now();
+    if (ms <= 0) return "0h 0m";
+    const h = Math.floor(ms / 3600000);
+    const m = Math.floor((ms % 3600000) / 60000);
+    return `${h}h ${m}m`;
+  }
+
   // -------------------------------------------------------------------
   // UI
   // -------------------------------------------------------------------
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
-      <div className="w-full max-w-md rounded-2xl border border-[#2E3140] bg-[#1B1D26] overflow-hidden">
+      <div className="w-full max-w-md rounded-2xl border border-[#2E3140] bg-[#1B1D26] overflow-hidden relative">
         {screen === "loading" && (
           <div className="p-10 text-center text-sm text-[#8C8FA3] font-mono">connecting…</div>
         )}
 
+        {screen === "banned" && (
+          <div className="p-10 text-center">
+            <p className="font-display text-lg">Chat banned for 12 hours</p>
+            <p className="text-xs text-[#8C8FA3] mt-2">
+              5 different people rated you below 2★. Time remaining:{" "}
+              {profile?.banned_until ? timeRemaining(profile.banned_until) : "—"}
+            </p>
+            <button
+              onClick={async () => {
+                const { data } = await supabase.from("profiles").select("*").eq("id", uid).single();
+                setProfile(data);
+                if (!data.banned_until || new Date(data.banned_until) <= new Date()) setScreen("landing");
+              }}
+              className="mt-5 text-xs font-mono text-[#8C8FA3] underline"
+            >
+              check again
+            </button>
+          </div>
+        )}
+
         {screen === "landing" && (
           <div className="p-6">
-            <div className="flex items-center justify-between">
-              <p className="font-display text-2xl">Tune in to<br />someone new.</p>
-              <div className="rounded-full px-3 py-1.5 bg-[#232532] text-xs font-mono whitespace-nowrap">
-                🪙 {profile ? profile.coins : 50}
+            <div className="flex items-center justify-between gap-2">
+              <p className="font-display text-2xl">
+                Tune in to<br />someone new.
+              </p>
+              <div className="flex flex-col gap-1.5 items-end">
+                <div className="rounded-full px-3 py-1.5 bg-[#232532] text-xs font-mono whitespace-nowrap">
+                  🪙 {profile ? profile.coins : 50}
+                </div>
+                {profile && (
+                  <div
+                    className="rounded-full px-3 py-1.5 text-xs font-mono whitespace-nowrap"
+                    style={{ background: restrictedFromGender ? "#3A1E22" : "#232532" }}
+                  >
+                    ⭐ {Number(profile.rating).toFixed(1)}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -266,18 +343,22 @@ export default function Home() {
             <div className="mt-4">
               <p className="text-xs font-mono text-[#8C8FA3] mb-1.5">MATCH WITH</p>
               <div className="grid grid-cols-3 gap-2">
-                {["any", "male", "female"].map((g) => (
-                  <button
-                    key={g}
-                    onClick={() => setGenderFilter(g)}
-                    className={`rounded-lg py-2.5 flex flex-col items-center gap-0.5 ${genderFilter === g ? "bg-[#5A2438] text-[#FF3D7F]" : "bg-[#232532] text-[#8C8FA3]"}`}
-                  >
-                    <span className="text-sm capitalize">{g}</span>
-                    <span className="text-[10px] font-mono opacity-70">
-                      {g === "any" ? "free" : `${GENDER_MATCH_COST} coins`}
-                    </span>
-                  </button>
-                ))}
+                {["any", "male", "female"].map((g) => {
+                  const locked = g !== "any" && restrictedFromGender;
+                  return (
+                    <button
+                      key={g}
+                      onClick={() => !locked && setGenderFilter(g)}
+                      className={`rounded-lg py-2.5 flex flex-col items-center gap-0.5 ${genderFilter === g ? "bg-[#5A2438] text-[#FF3D7F]" : "bg-[#232532] text-[#8C8FA3]"}`}
+                      style={{ opacity: locked ? 0.5 : 1 }}
+                    >
+                      <span className="text-sm capitalize">{locked ? "🔒" : g}</span>
+                      <span className="text-[10px] font-mono opacity-70">
+                        {g === "any" ? "free" : locked ? "rating too low" : `${GENDER_MATCH_COST} coins`}
+                      </span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
@@ -311,9 +392,21 @@ export default function Home() {
                 </button>
                 <p className="font-display text-sm">{partner.username}</p>
               </div>
-              <button onClick={nextPerson} className="p-2 rounded-lg bg-[#232532] text-xs">
+              <button onClick={requestNext} className="p-2 rounded-lg bg-[#232532] text-xs">
                 next
               </button>
+            </div>
+
+            <div
+              className="px-5 py-1.5 text-xs font-mono"
+              style={{
+                background: elapsed >= RATE_UNLOCK_SECONDS ? "#1E3D38" : "#232532",
+                color: elapsed >= RATE_UNLOCK_SECONDS ? "#5EEAD4" : "#5C5F70",
+              }}
+            >
+              {elapsed >= RATE_UNLOCK_SECONDS
+                ? "Rating unlocked for this chat"
+                : `Rating unlocks in ${RATE_UNLOCK_SECONDS - elapsed}s`}
             </div>
 
             <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-2">
@@ -351,6 +444,27 @@ export default function Home() {
                 className="px-4 rounded-lg bg-[#FF3D7F] text-[#1A0810] text-sm font-display"
               >
                 Send
+              </button>
+            </div>
+          </div>
+        )}
+
+        {showRatingModal && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center p-6" style={{ background: "rgba(0,0,0,0.7)" }}>
+            <div className="w-full rounded-2xl p-6 text-center bg-[#1B1D26] border border-[#2E3140]">
+              <p className="font-display text-base">How was chatting with {partner?.username}?</p>
+              <div className="flex justify-center gap-1 mt-4">
+                {[1, 2, 3, 4, 5].map((n) => (
+                  <button key={n} onMouseEnter={() => setRatingHover(n)} onMouseLeave={() => setRatingHover(0)} onClick={() => submitRating(n)}>
+                    <span style={{ fontSize: 28, color: n <= ratingHover ? "#FFB454" : "#5C5F70" }}>★</span>
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] font-mono mt-3 text-[#5C5F70]">
+                5 low ratings (under 2★) from different people triggers a 12h ban.
+              </p>
+              <button onClick={proceedNext} className="mt-3 text-xs font-mono underline text-[#5C5F70]">
+                skip rating, go to next
               </button>
             </div>
           </div>
