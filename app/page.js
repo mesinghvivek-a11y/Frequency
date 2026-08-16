@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 
-const GENDER_MATCH_COST = 5;
 const RATE_UNLOCK_SECONDS = 30;
 
 const AVATAR_PALETTE = ["#FF3D7F", "#5EEAD4", "#FFB454", "#8C7CF0", "#4ADE80", "#F5C24D", "#60A5FA", "#F97316", "#EC4899", "#34D399"];
@@ -62,6 +61,7 @@ export default function Home() {
   const [screen, setScreen] = useState("loading"); // loading | landing | matching | chat | banned | friendChat
   const [homeTab, setHomeTab] = useState("find"); // find | friends
   const [error, setError] = useState("");
+  const [settings, setSettings] = useState({ gender_match_cost: 5, initial_coins: 50 });
 
   // signup form
   const [username, setUsername] = useState("");
@@ -80,7 +80,7 @@ export default function Home() {
   const [ratingHover, setRatingHover] = useState(0);
   const [partnerLeft, setPartnerLeft] = useState(false);
   const [suggestions, setSuggestions] = useState([]);
-  const [matchFriendStatus, setMatchFriendStatus] = useState(null); // null | pending | accepted | already_friends
+  const [matchFriendStatus, setMatchFriendStatus] = useState(null);
   const messagesEndRef = useRef(null);
 
   // friends
@@ -94,10 +94,20 @@ export default function Home() {
   const [friendDraft, setFriendDraft] = useState("");
   const friendMessagesEndRef = useRef(null);
 
+  // owner dashboard
+  const [showAdmin, setShowAdmin] = useState(false);
+  const [adminStats, setAdminStats] = useState(null);
+  const [adminError, setAdminError] = useState("");
+  const [adminCostInput, setAdminCostInput] = useState(5);
+  const [adminCoinsInput, setAdminCoinsInput] = useState(50);
+  const [adminPremiumUsername, setAdminPremiumUsername] = useState("");
+  const [adminPremiumDays, setAdminPremiumDays] = useState(30);
+
   const restrictedFromGender = profile && profile.rating < 2;
+  const isPremiumActive = profile?.is_premium && profile?.premium_until && new Date(profile.premium_until) > new Date();
 
   // -------------------------------------------------------------------
-  // 1. Sign in anonymously the first time someone visits
+  // 1. Sign in anonymously, load profile + platform settings
   // -------------------------------------------------------------------
   useEffect(() => {
     async function init() {
@@ -109,6 +119,9 @@ export default function Home() {
         user = data.user;
       }
       setUid(user.id);
+
+      const { data: settingsRow } = await supabase.from("platform_settings").select("*").single();
+      if (settingsRow) setSettings(settingsRow);
 
       const { data: existingProfile } = await supabase.from("profiles").select("*").eq("id", user.id).maybeSingle();
       if (existingProfile) {
@@ -135,7 +148,7 @@ export default function Home() {
     }
     const { data, error } = await supabase
       .from("profiles")
-      .insert({ id: uid, username, gender, avatar_id: randomAvatarId(gender) })
+      .insert({ id: uid, username, gender, avatar_id: randomAvatarId(gender), coins: settings.initial_coins })
       .select()
       .single();
     if (error) {
@@ -148,7 +161,9 @@ export default function Home() {
   }
 
   // -------------------------------------------------------------------
-  // 3. Matching
+  // 3. Matching — cost + premium bypass are enforced inside find_match
+  //    itself; the checks here are just for a fast, friendly error
+  //    message before making the round trip.
   // -------------------------------------------------------------------
   async function startMatching(freshProfile) {
     setError("");
@@ -157,21 +172,16 @@ export default function Home() {
       setScreen("banned");
       return;
     }
-    if (genderFilter !== "any") {
+    const premiumNow = currentProfile?.is_premium && currentProfile?.premium_until && new Date(currentProfile.premium_until) > new Date();
+    if (genderFilter !== "any" && !premiumNow) {
       if (currentProfile && currentProfile.rating < 2) {
         setError("Your rating is below 2★ — specific-gender matching is locked right now.");
         return;
       }
-      if ((currentProfile?.coins ?? 0) < GENDER_MATCH_COST) {
-        setError(`Not enough coins. A ${genderFilter} match costs ${GENDER_MATCH_COST} coins.`);
+      if ((currentProfile?.coins ?? 0) < settings.gender_match_cost) {
+        setError(`Not enough coins. A ${genderFilter} match costs ${settings.gender_match_cost} coins — or go Premium.`);
         return;
       }
-      const { data: newBalance, error: spendError } = await supabase.rpc("spend_coins", { p_amount: GENDER_MATCH_COST });
-      if (spendError) {
-        setError(`Not enough coins. A ${genderFilter} match costs ${GENDER_MATCH_COST} coins.`);
-        return;
-      }
-      setProfile((p) => ({ ...p, coins: newBalance }));
     }
     setScreen("matching");
     const { data: newSessionId, error } = await supabase.rpc("find_match", {
@@ -180,9 +190,13 @@ export default function Home() {
     });
     if (error) {
       if (error.message.includes("banned_until")) setScreen("banned");
+      else if (error.message.includes("insufficient_coins")) { setError(`Not enough coins. A ${genderFilter} match costs ${settings.gender_match_cost} coins — or go Premium.`); setScreen("landing"); }
+      else if (error.message.includes("rating_too_low")) { setError("Your rating is below 2★ — specific-gender matching is locked right now."); setScreen("landing"); }
       else { setError(error.message); setScreen("landing"); }
       return;
     }
+    const { data: refreshed } = await supabase.from("profiles").select("*").eq("id", uid).single();
+    if (refreshed) setProfile(refreshed);
     if (newSessionId) await enterSession(newSessionId);
   }
 
@@ -296,7 +310,7 @@ export default function Home() {
   }
 
   // -------------------------------------------------------------------
-  // 6. Friends tab: search, requests, list
+  // 6. Friends
   // -------------------------------------------------------------------
   async function loadFriendsData() {
     if (!uid) return;
@@ -311,9 +325,7 @@ export default function Home() {
       .from("friend_chats")
       .select("*, a:user_a(id, username, avatar_id), b:user_b(id, username, avatar_id)")
       .or(`user_a.eq.${uid},user_b.eq.${uid}`);
-    setFriendsList(
-      (chats || []).map((c) => ({ chatId: c.id, partner: c.user_a === uid ? c.b : c.a }))
-    );
+    setFriendsList((chats || []).map((c) => ({ chatId: c.id, partner: c.user_a === uid ? c.b : c.a })));
   }
 
   useEffect(() => {
@@ -330,22 +342,16 @@ export default function Home() {
     const { data } = await supabase.from("profiles").select("id, username, avatar_id").ilike("username", `%${q}%`).neq("id", uid).limit(10);
     setFriendResults(data || []);
   }
-
   async function sendRequestTo(recipientId) {
     const { error } = await supabase.rpc("send_friend_request", { p_recipient_id: recipientId });
     if (!error) { searchUsers(); loadFriendsData(); }
   }
-
   async function respondRequest(requestId, accept) {
     await supabase.rpc("respond_to_friend_request", { p_request_id: requestId, p_accept: accept });
     loadFriendsData();
   }
-
   async function openFriendChat(chatId, partnerProfile) {
-    setFriendChatId(chatId);
-    setFriendPartner(partnerProfile);
-    setFriendMessages([]);
-    setScreen("friendChat");
+    setFriendChatId(chatId); setFriendPartner(partnerProfile); setFriendMessages([]); setScreen("friendChat");
   }
 
   useEffect(() => {
@@ -367,6 +373,36 @@ export default function Home() {
     if (!friendDraft.trim()) return;
     const { error } = await supabase.from("friend_messages").insert({ chat_id: friendChatId, sender_id: uid, body: friendDraft.trim() });
     if (!error) setFriendDraft("");
+  }
+
+  // -------------------------------------------------------------------
+  // 7. Owner dashboard
+  // -------------------------------------------------------------------
+  async function openAdmin() {
+    setAdminError("");
+    const { data, error } = await supabase.rpc("admin_stats");
+    if (error) { setAdminError("Not authorized, or something went wrong."); return; }
+    setAdminStats(data);
+    setAdminCostInput(settings.gender_match_cost);
+    setAdminCoinsInput(settings.initial_coins);
+    setShowAdmin(true);
+  }
+  async function saveAdminSettings() {
+    const { error } = await supabase.rpc("update_platform_settings", {
+      p_gender_match_cost: adminCostInput,
+      p_initial_coins: adminCoinsInput,
+    });
+    if (!error) setSettings({ gender_match_cost: adminCostInput, initial_coins: adminCoinsInput });
+  }
+  async function grantPremium(grant) {
+    setAdminError("");
+    const { error } = await supabase.rpc("admin_set_premium", {
+      p_username: adminPremiumUsername,
+      p_premium: grant,
+      p_days: adminPremiumDays,
+    });
+    if (error) setAdminError("Couldn't find that username, or something went wrong.");
+    else setAdminPremiumUsername("");
   }
 
   // -------------------------------------------------------------------
@@ -399,12 +435,11 @@ export default function Home() {
         {screen === "landing" && (
           <div className="p-6">
             <div className="flex gap-4 mb-4 border-b border-[#2E3140]">
-              <button onClick={() => setHomeTab("find")} className="pb-2 text-sm font-mono" style={{ color: homeTab === "find" ? "#F0F0EE" : "#5C5F70", borderBottom: homeTab === "find" ? "2px solid #FF3D7F" : "2px solid transparent" }}>
-                Find New
-              </button>
+              <button onClick={() => setHomeTab("find")} className="pb-2 text-sm font-mono" style={{ color: homeTab === "find" ? "#F0F0EE" : "#5C5F70", borderBottom: homeTab === "find" ? "2px solid #FF3D7F" : "2px solid transparent" }}>Find New</button>
               <button onClick={() => setHomeTab("friends")} className="pb-2 text-sm font-mono flex items-center gap-1.5" style={{ color: homeTab === "friends" ? "#F0F0EE" : "#5C5F70", borderBottom: homeTab === "friends" ? "2px solid #FF3D7F" : "2px solid transparent" }}>
                 Friends {incomingRequests.length > 0 && <span className="rounded-full bg-[#FF3D7F] text-[#1A0810] text-[10px] px-1.5">{incomingRequests.length}</span>}
               </button>
+              {profile?.is_admin && <button onClick={openAdmin} className="pb-2 text-sm font-mono ml-auto" style={{ color: "#FFD400" }}>Owner ⚙</button>}
             </div>
 
             {homeTab === "find" && (
@@ -415,12 +450,11 @@ export default function Home() {
                     <p className="font-display text-2xl leading-tight">Tune in to<br />someone new.</p>
                   </div>
                   <div className="flex flex-col gap-1.5 items-end shrink-0">
-                    <div className="rounded-full px-3 py-1.5 bg-[#232532] text-xs font-mono whitespace-nowrap">🪙 {profile ? profile.coins : 50}</div>
+                    <div className="rounded-full px-3 py-1.5 bg-[#232532] text-xs font-mono whitespace-nowrap">🪙 {profile ? profile.coins : settings.initial_coins}</div>
                     {profile && (
-                      <div className="rounded-full px-3 py-1.5 text-xs font-mono whitespace-nowrap" style={{ background: restrictedFromGender ? "#3A1E22" : "#232532" }}>
-                        ⭐ {Number(profile.rating).toFixed(1)}
-                      </div>
+                      <div className="rounded-full px-3 py-1.5 text-xs font-mono whitespace-nowrap" style={{ background: restrictedFromGender ? "#3A1E22" : "#232532" }}>⭐ {Number(profile.rating).toFixed(1)}</div>
                     )}
+                    {isPremiumActive && <div className="rounded-full px-3 py-1.5 text-xs font-mono whitespace-nowrap bg-[#3D3320] text-[#FFD400]">👑 Premium</div>}
                   </div>
                 </div>
 
@@ -443,7 +477,7 @@ export default function Home() {
                       return (
                         <button key={g} onClick={() => !locked && setGenderFilter(g)} className={`rounded-lg py-2.5 flex flex-col items-center gap-0.5 ${genderFilter === g ? "bg-[#5A2438] text-[#FF3D7F]" : "bg-[#232532] text-[#8C8FA3]"}`} style={{ opacity: locked ? 0.5 : 1 }}>
                           <span className="text-sm capitalize">{locked ? "🔒" : g}</span>
-                          <span className="text-[10px] font-mono opacity-70">{g === "any" ? "free" : locked ? "rating too low" : `${GENDER_MATCH_COST} coins`}</span>
+                          <span className="text-[10px] font-mono opacity-70">{g === "any" ? "free" : locked ? "rating too low" : isPremiumActive ? "included" : `${settings.gender_match_cost} coins`}</span>
                         </button>
                       );
                     })}
@@ -452,9 +486,7 @@ export default function Home() {
 
                 {error && <p className="text-xs font-mono text-[#FF5C5C] mt-3">{error}</p>}
 
-                <button onClick={createProfileAndMatch} className="w-full mt-5 rounded-xl py-3.5 font-display bg-[#FF3D7F] text-[#1A0810]">
-                  Start matching
-                </button>
+                <button onClick={createProfileAndMatch} className="w-full mt-5 rounded-xl py-3.5 font-display bg-[#FF3D7F] text-[#1A0810]">Start matching</button>
               </>
             )}
 
@@ -468,7 +500,6 @@ export default function Home() {
                       <input value={friendSearch} onChange={(e) => setFriendSearch(e.target.value)} onKeyDown={(e) => e.key === "Enter" && searchUsers()} placeholder="Find by username" className="flex-1 rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none" />
                       <button onClick={searchUsers} className="rounded-lg px-3 bg-[#232532] text-xs font-mono">Search</button>
                     </div>
-
                     {friendResults.length > 0 && (
                       <div className="mt-3 flex flex-col gap-1.5">
                         {friendResults.map((u) => (
@@ -479,7 +510,6 @@ export default function Home() {
                         ))}
                       </div>
                     )}
-
                     {incomingRequests.length > 0 && (
                       <div className="mt-4">
                         <p className="text-[10px] font-mono text-[#5C5F70] mb-1.5">FRIEND REQUESTS</p>
@@ -496,7 +526,6 @@ export default function Home() {
                         </div>
                       </div>
                     )}
-
                     <p className="text-[10px] font-mono text-[#5C5F70] mt-4 mb-1.5">YOUR FRIENDS ({friendsList.length})</p>
                     {friendsList.length === 0 ? (
                       <p className="text-xs font-mono text-[#5C5F70]">No friends yet — search above, or add someone mid-chat.</p>
@@ -618,7 +647,67 @@ export default function Home() {
             </div>
           </div>
         )}
+
+        {showAdmin && (
+          <div className="absolute inset-0 z-20 overflow-y-auto p-5" style={{ background: "#1B1D26" }}>
+            <div className="flex items-center justify-between mb-4">
+              <p className="font-display text-base">Owner dashboard</p>
+              <button onClick={() => setShowAdmin(false)} className="text-xs font-mono text-[#8C8FA3]">close</button>
+            </div>
+
+            {adminError && <p className="text-xs font-mono text-[#FF5C5C] mb-3">{adminError}</p>}
+
+            {adminStats && (
+              <div className="grid grid-cols-2 gap-2 mb-5">
+                <StatCard label="TOTAL MEMBERS" value={adminStats.total_members} />
+                <StatCard label="PREMIUM" value={adminStats.premium_count} />
+                <StatCard label="MALE / FEMALE" value={`${adminStats.male_count} / ${adminStats.female_count}`} />
+                <StatCard label="AVG RATING" value={`${adminStats.avg_rating}★`} />
+                <StatCard label="TOTAL COINS" value={adminStats.total_coins} />
+                <StatCard label="CURRENTLY BANNED" value={adminStats.currently_banned} />
+                <StatCard label="FRIEND PAIRS" value={adminStats.total_friend_pairs} />
+                <StatCard label="CHAT SESSIONS" value={adminStats.total_chat_sessions} />
+                <StatCard label="TOTAL MESSAGES" value={adminStats.total_messages} />
+                <StatCard label="SIGNUPS, 24H" value={adminStats.signups_last_24h} />
+              </div>
+            )}
+
+            <p className="text-xs font-mono text-[#5C5F70] mb-2">COIN SETTINGS</p>
+            <div className="flex flex-col gap-2 mb-2">
+              <label className="flex items-center justify-between bg-[#232532] rounded-lg px-3 py-2 text-sm">
+                Coins per gender-filtered match
+                <input type="number" value={adminCostInput} onChange={(e) => setAdminCostInput(parseInt(e.target.value) || 0)} className="w-16 text-right bg-[#1B1D26] rounded px-2 py-1 text-xs" />
+              </label>
+              <label className="flex items-center justify-between bg-[#232532] rounded-lg px-3 py-2 text-sm">
+                Initial coins for new signups
+                <input type="number" value={adminCoinsInput} onChange={(e) => setAdminCoinsInput(parseInt(e.target.value) || 0)} className="w-16 text-right bg-[#1B1D26] rounded px-2 py-1 text-xs" />
+              </label>
+            </div>
+            <button onClick={saveAdminSettings} className="w-full rounded-lg py-2.5 text-sm font-display bg-[#232532] mb-5">Save coin settings</button>
+
+            <p className="text-xs font-mono text-[#5C5F70] mb-2">GRANT / REVOKE PREMIUM (manual, until real payments are wired up)</p>
+            <input value={adminPremiumUsername} onChange={(e) => setAdminPremiumUsername(e.target.value)} placeholder="Username" className="w-full rounded-lg px-3 py-2 bg-[#232532] text-sm outline-none mb-2" />
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-xs text-[#8C8FA3]">for</span>
+              <input type="number" value={adminPremiumDays} onChange={(e) => setAdminPremiumDays(parseInt(e.target.value) || 0)} className="w-16 bg-[#232532] rounded px-2 py-1 text-xs" />
+              <span className="text-xs text-[#8C8FA3]">days</span>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={() => grantPremium(true)} className="flex-1 rounded-lg py-2.5 text-sm font-display bg-[#3D3320] text-[#FFD400]">Grant Premium</button>
+              <button onClick={() => grantPremium(false)} className="flex-1 rounded-lg py-2.5 text-sm font-display bg-[#232532] text-[#8C8FA3]">Revoke</button>
+            </div>
+          </div>
+        )}
       </div>
+    </div>
+  );
+}
+
+function StatCard({ label, value }) {
+  return (
+    <div className="rounded-lg bg-[#232532] p-3">
+      <p className="text-[9px] font-mono text-[#5C5F70]">{label}</p>
+      <p className="font-display text-lg">{value}</p>
     </div>
   );
 }
