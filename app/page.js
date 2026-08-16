@@ -27,6 +27,7 @@ export default function Home() {
   const [elapsed, setElapsed] = useState(0);
   const [showRatingModal, setShowRatingModal] = useState(false);
   const [ratingHover, setRatingHover] = useState(0);
+  const [partnerLeft, setPartnerLeft] = useState(false);
   const messagesEndRef = useRef(null);
 
   const restrictedFromGender = profile && profile.rating < 2;
@@ -171,13 +172,15 @@ export default function Home() {
     setPartner(partnerProfile);
     setMessages([]);
     setStreak(0);
+    setPartnerLeft(false);
     setChatStartedAt(Date.now());
     setElapsed(0);
     setScreen("chat");
   }
 
   // -------------------------------------------------------------------
-  // 4. Chat: realtime messages + the rating-unlock timer
+  // 4. Chat: realtime messages, the rating-unlock timer, and detecting
+  //    when the other person leaves or skips to someone new
   // -------------------------------------------------------------------
   useEffect(() => {
     if (screen !== "chat" || !sessionId) return;
@@ -189,7 +192,7 @@ export default function Home() {
       .order("created_at", { ascending: true })
       .then(({ data }) => setMessages(data || []));
 
-    const channel = supabase
+    const messagesChannel = supabase
       .channel(`session-${sessionId}`)
       .on(
         "postgres_changes",
@@ -200,7 +203,24 @@ export default function Home() {
         }
       )
       .subscribe();
-    return () => supabase.removeChannel(channel);
+
+    // Watches this same session for the OTHER person ending it
+    // (via Next or Home) so we can tell the person still here.
+    const sessionChannel = supabase
+      .channel(`session-status-${sessionId}`)
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "chat_sessions", filter: `id=eq.${sessionId}` },
+        (payload) => {
+          if (payload.new.ended_at) setPartnerLeft(true);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(messagesChannel);
+      supabase.removeChannel(sessionChannel);
+    };
   }, [screen, sessionId, uid]);
 
   useEffect(() => {
@@ -214,7 +234,7 @@ export default function Home() {
   }, [messages]);
 
   async function sendMessage() {
-    if (!draft.trim() || streak >= 6) return;
+    if (!draft.trim() || streak >= 6 || partnerLeft) return;
     const { error } = await supabase
       .from("messages")
       .insert({ session_id: sessionId, sender_id: uid, body: draft.trim() });
@@ -409,6 +429,15 @@ export default function Home() {
                 : `Rating unlocks in ${RATE_UNLOCK_SECONDS - elapsed}s`}
             </div>
 
+            {partnerLeft && (
+              <div className="px-5 py-2 text-xs font-mono bg-[#3A1E22] text-[#FF5C5C] flex items-center justify-between">
+                <span>{partner.username} has left the chat</span>
+                <button onClick={requestNext} className="underline shrink-0 ml-2">
+                  find next
+                </button>
+              </div>
+            )}
+
             <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-2">
               {messages.map((m) => (
                 <div
@@ -423,7 +452,7 @@ export default function Home() {
               <div ref={messagesEndRef} />
             </div>
 
-            {streak >= 6 && (
+            {streak >= 6 && !partnerLeft && (
               <div className="px-5 py-1.5 text-xs font-mono bg-[#3A1E22] text-[#FF5C5C]">
                 6 messages sent — wait for a reply
               </div>
@@ -434,13 +463,13 @@ export default function Home() {
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-                disabled={streak >= 6}
-                placeholder="Type a message"
+                disabled={streak >= 6 || partnerLeft}
+                placeholder={partnerLeft ? "They've left this chat" : "Type a message"}
                 className="flex-1 rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none"
               />
               <button
                 onClick={sendMessage}
-                disabled={streak >= 6}
+                disabled={streak >= 6 || partnerLeft}
                 className="px-4 rounded-lg bg-[#FF3D7F] text-[#1A0810] text-sm font-display"
               >
                 Send
