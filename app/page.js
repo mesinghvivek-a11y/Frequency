@@ -6,15 +6,65 @@ import { supabase } from "../lib/supabaseClient";
 const GENDER_MATCH_COST = 5;
 const RATE_UNLOCK_SECONDS = 30;
 
+const AVATAR_PALETTE = ["#FF3D7F", "#5EEAD4", "#FFB454", "#8C7CF0", "#4ADE80", "#F5C24D", "#60A5FA", "#F97316", "#EC4899", "#34D399"];
+
+function Avatar({ id, size = 36 }) {
+  if (!id) {
+    return (
+      <div style={{ width: size, height: size, borderRadius: "50%", background: "#232532", flexShrink: 0 }} />
+    );
+  }
+  const gender = id[0];
+  const idx = (parseInt(id.slice(1), 10) - 1) % AVATAR_PALETTE.length;
+  const bg = AVATAR_PALETTE[idx];
+  return (
+    <svg width={size} height={size} viewBox="0 0 40 40" style={{ borderRadius: "50%", flexShrink: 0 }}>
+      <circle cx="20" cy="20" r="20" fill={bg} />
+      <circle cx="20" cy="23" r="10" fill="#F2C79E" />
+      {gender === "f" ? (
+        <path d="M5 19 Q20 1 35 19 L35 26 Q20 13 5 26 Z" fill="#3A2417" />
+      ) : (
+        <path d="M8 17 Q20 4 32 17 L32 20 Q20 10 8 20 Z" fill="#2A1B10" />
+      )}
+      <circle cx="16" cy="23" r="1.6" fill="#2A2A2A" />
+      <circle cx="24" cy="23" r="1.6" fill="#2A2A2A" />
+      <path d="M15 28 Q20 31 25 28" stroke="#7A4A33" strokeWidth="1.5" fill="none" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+const ICEBREAKERS = [
+  "If your life had a theme song right now, what would it be?",
+  "What's the last thing that made you laugh out loud?",
+  "Beach sunset or mountain sunrise — pick one and defend it.",
+  "What's a small thing that instantly makes your day better?",
+  "If you could teleport anywhere for the next hour, where?",
+  "What's something you're weirdly good at?",
+  "Coffee, tea, or neither?",
+  "What's a movie you can rewatch endlessly?",
+  "What's the most spontaneous thing you've ever done?",
+  "If you had a free weekend with zero plans, what would you do?",
+  "What's a skill you wish you'd picked up as a kid?",
+  "Window seat or aisle seat, and why?",
+  "What's your go-to comfort food?",
+  "What's a place you've never been but really want to visit?",
+  "Early bird or night owl?",
+  "What song do you have on repeat lately?",
+];
+function pickSuggestions() {
+  return [...ICEBREAKERS].sort(() => Math.random() - 0.5).slice(0, 4);
+}
+
 export default function Home() {
   const [uid, setUid] = useState(null);
   const [profile, setProfile] = useState(null);
   const [screen, setScreen] = useState("loading"); // loading | landing | matching | chat | banned
   const [error, setError] = useState("");
 
-  // landing form
+  // landing / signup form
   const [username, setUsername] = useState("");
   const [gender, setGender] = useState("male");
+  const [avatarId, setAvatarId] = useState("m1");
   const [genderFilter, setGenderFilter] = useState("any");
 
   // chat
@@ -28,9 +78,15 @@ export default function Home() {
   const [showRatingModal, setShowRatingModal] = useState(false);
   const [ratingHover, setRatingHover] = useState(0);
   const [partnerLeft, setPartnerLeft] = useState(false);
+  const [suggestions, setSuggestions] = useState([]);
   const messagesEndRef = useRef(null);
 
   const restrictedFromGender = profile && profile.rating < 2;
+
+  function pickGender(g) {
+    setGender(g);
+    setAvatarId(`${g[0]}1`);
+  }
 
   // -------------------------------------------------------------------
   // 1. Sign in anonymously the first time someone visits
@@ -83,7 +139,7 @@ export default function Home() {
     }
     const { data, error } = await supabase
       .from("profiles")
-      .insert({ id: uid, username, gender })
+      .insert({ id: uid, username, gender, avatar_id: avatarId })
       .select()
       .single();
 
@@ -175,6 +231,7 @@ export default function Home() {
     setPartnerLeft(false);
     setChatStartedAt(Date.now());
     setElapsed(0);
+    setSuggestions(pickSuggestions());
     setScreen("chat");
   }
 
@@ -204,8 +261,6 @@ export default function Home() {
       )
       .subscribe();
 
-    // Watches this same session for the OTHER person ending it
-    // (via Next or Home) so we can tell the person still here.
     const sessionChannel = supabase
       .channel(`session-status-${sessionId}`)
       .on(
@@ -317,10 +372,13 @@ export default function Home() {
         {screen === "landing" && (
           <div className="p-6">
             <div className="flex items-center justify-between gap-2">
-              <p className="font-display text-2xl">
-                Tune in to<br />someone new.
-              </p>
-              <div className="flex flex-col gap-1.5 items-end">
+              <div className="flex items-center gap-2">
+                {profile && <Avatar id={profile.avatar_id} size={38} />}
+                <p className="font-display text-2xl leading-tight">
+                  Tune in to<br />someone new.
+                </p>
+              </div>
+              <div className="flex flex-col gap-1.5 items-end shrink-0">
                 <div className="rounded-full px-3 py-1.5 bg-[#232532] text-xs font-mono whitespace-nowrap">
                   🪙 {profile ? profile.coins : 50}
                 </div>
@@ -345,17 +403,31 @@ export default function Home() {
                 />
                 <div className="flex gap-2">
                   <button
-                    onClick={() => setGender("male")}
+                    onClick={() => pickGender("male")}
                     className={`flex-1 rounded-lg py-2 text-sm ${gender === "male" ? "bg-[#1E3D38] text-[#5EEAD4]" : "bg-[#232532] text-[#8C8FA3]"}`}
                   >
                     Male
                   </button>
                   <button
-                    onClick={() => setGender("female")}
+                    onClick={() => pickGender("female")}
                     className={`flex-1 rounded-lg py-2 text-sm ${gender === "female" ? "bg-[#1E3D38] text-[#5EEAD4]" : "bg-[#232532] text-[#8C8FA3]"}`}
                   >
                     Female
                   </button>
+                </div>
+
+                <p className="text-[10px] font-mono text-[#5C5F70] mt-1">PICK YOUR AVATAR</p>
+                <div className="grid grid-cols-5 gap-2">
+                  {Array.from({ length: 10 }, (_, i) => `${gender[0]}${i + 1}`).map((id) => (
+                    <button
+                      key={id}
+                      onClick={() => setAvatarId(id)}
+                      className="rounded-full p-0.5"
+                      style={{ border: `2px solid ${avatarId === id ? "#FF3D7F" : "transparent"}` }}
+                    >
+                      <Avatar id={id} size={36} />
+                    </button>
+                  ))}
                 </div>
               </div>
             )}
@@ -410,6 +482,7 @@ export default function Home() {
                 <button onClick={goHome} className="p-2 rounded-lg bg-[#232532] text-xs">
                   home
                 </button>
+                <Avatar id={partner.avatar_id} size={32} />
                 <p className="font-display text-sm">{partner.username}</p>
               </div>
               <button onClick={requestNext} className="p-2 rounded-lg bg-[#232532] text-xs">
@@ -455,6 +528,32 @@ export default function Home() {
             {streak >= 6 && !partnerLeft && (
               <div className="px-5 py-1.5 text-xs font-mono bg-[#3A1E22] text-[#FF5C5C]">
                 6 messages sent — wait for a reply
+              </div>
+            )}
+
+            {messages.length < 3 && !partnerLeft && (
+              <div className="px-4 pt-2">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-[10px] font-mono text-[#5C5F70]">NEED AN OPENER?</span>
+                  <button
+                    onClick={() => setSuggestions(pickSuggestions())}
+                    className="text-[10px] font-mono text-[#5EEAD4]"
+                  >
+                    shuffle
+                  </button>
+                </div>
+                <div className="flex gap-1.5 overflow-x-auto pb-1">
+                  {suggestions.map((s, i) => (
+                    <button
+                      key={i}
+                      onClick={() => setDraft(s)}
+                      className="shrink-0 rounded-full px-3 py-1.5 text-[11px] whitespace-nowrap bg-[#232532] border border-[#2E3140]"
+                      style={{ maxWidth: 220 }}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
 
