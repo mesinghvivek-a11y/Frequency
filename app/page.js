@@ -120,6 +120,35 @@ function MiniGame() {
   );
 }
 
+// --- Preferences sheet (Premium-gated age/country filters) -------------
+function PreferencesSheet({ ageFilter, setAgeFilter, countryFilter, setCountryFilter, isPremiumActive, onClose }) {
+  return (
+    <div className="absolute inset-0 z-30 flex items-end justify-center" style={{ background: "rgba(0,0,0,0.6)" }} onClick={onClose}>
+      <div className="w-full rounded-t-2xl p-5 bg-[#1B1D26] border border-[#2E3140]" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-3">
+          <p className="font-display text-base">Preferences</p>
+          <button onClick={onClose} className="text-xs font-mono text-[#8C8FA3]">close</button>
+        </div>
+        {!isPremiumActive && <p className="text-[11px] font-mono mb-3 text-[#FFD400]">👑 Picking anything but "Any" requires Premium.</p>}
+
+        <p className="text-xs font-mono text-[#8C8FA3] mb-1.5">AGE RANGE</p>
+        <div className="grid grid-cols-4 gap-1.5 mb-4">
+          {AGE_RANGES.map((r) => (
+            <button key={r} onClick={() => isPremiumActive && setAgeFilter((f) => (f === r ? "any" : r))} className="rounded-lg py-2 text-[11px] font-mono" style={{ background: ageFilter === r ? "#1E3D38" : "#232532", color: ageFilter === r ? "#5EEAD4" : "#8C8FA3", opacity: isPremiumActive ? 1 : 0.5 }}>{r}</button>
+          ))}
+        </div>
+
+        <p className="text-xs font-mono text-[#8C8FA3] mb-1.5">COUNTRY</p>
+        <div className="flex gap-1.5 overflow-x-auto pb-1">
+          {COUNTRIES.map((c) => (
+            <button key={c.code} onClick={() => isPremiumActive && setCountryFilter((f) => (f === c.code ? "any" : c.code))} className="shrink-0 rounded-full px-2.5 py-1.5 text-xs" style={{ background: countryFilter === c.code ? "#1E3D38" : "#232532", color: countryFilter === c.code ? "#5EEAD4" : "#8C8FA3", opacity: isPremiumActive ? 1 : 0.5 }}>{c.flag} {c.code}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   const [uid, setUid] = useState(null);
   const [profile, setProfile] = useState(null);
@@ -129,6 +158,7 @@ export default function Home() {
   const [settings, setSettings] = useState({ gender_match_cost: 5, initial_coins: 50, show_online_count: true, online_count_override: 50 });
   const [notif, setNotif] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showPrefs, setShowPrefs] = useState(false);
 
   // signup form
   const [username, setUsername] = useState("");
@@ -143,6 +173,7 @@ export default function Home() {
   // random-match chat
   const [sessionId, setSessionId] = useState(null);
   const [partner, setPartner] = useState(null);
+  const [lastPartner, setLastPartner] = useState(null);
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
   const [streak, setStreak] = useState(0);
@@ -178,6 +209,7 @@ export default function Home() {
   const [adminOnlineCount, setAdminOnlineCount] = useState(50);
   const [adminPremiumUsername, setAdminPremiumUsername] = useState("");
   const [adminPremiumDays, setAdminPremiumDays] = useState(30);
+  const [adminVerifiedUsername, setAdminVerifiedUsername] = useState("");
 
   const restrictedFromGender = profile && profile.rating < 2;
   const isPremiumActive = profile?.is_premium && profile?.premium_until && new Date(profile.premium_until) > new Date();
@@ -319,6 +351,7 @@ export default function Home() {
   function requestNext() { setShowNextConfirm(true); }
   function confirmNext() { setShowNextConfirm(false); if (elapsed >= RATE_UNLOCK_SECONDS) setShowRatingModal(true); else proceedNext(); }
   async function proceedNext() {
+    if (partner) setLastPartner(partner);
     if (sessionId) await supabase.rpc("end_session", { p_session_id: sessionId });
     setSessionId(null); setPartner(null); setShowRatingModal(false);
     await startMatching();
@@ -334,10 +367,25 @@ export default function Home() {
   function requestGoHome() { setShowHomeConfirm(true); }
   async function confirmGoHome() { setShowHomeConfirm(false); await goHome(); }
   async function goHome() {
+    if (partner) setLastPartner(partner);
     if (sessionId) await supabase.rpc("end_session", { p_session_id: sessionId });
     if (screen === "matching") await supabase.rpc("leave_queue");
     setSessionId(null); setPartner(null); setFriendChatId(null); setFriendPartner(null);
     setScreen("landing");
+  }
+
+  async function rewindToLast() {
+    setError("");
+    if (!isPremiumActive) { setError("Rewind is a Premium feature."); return; }
+    if (!lastPartner) return;
+    const { data: newSessionId, error } = await supabase.rpc("rewind_to", { p_partner_id: lastPartner.id });
+    if (error) {
+      if (error.message.includes("partner_not_available")) setError(`${lastPartner.username} isn't online right now.`);
+      else if (error.message.includes("premium_required")) setError("Rewind is a Premium feature.");
+      else setError(error.message);
+      return;
+    }
+    if (newSessionId) await enterSession(newSessionId);
   }
 
   function timeRemaining(untilIso) {
@@ -348,9 +396,13 @@ export default function Home() {
 
   async function loadFriendsData() {
     if (!uid) return;
-    const { data: incoming } = await supabase.from("friend_requests").select("*, requester:requester_id(id, username, avatar_id)").eq("recipient_id", uid).eq("status", "pending");
+    const { data: incoming } = await supabase
+      .from("friend_requests")
+      .select("*, requester:requester_id(id, username, avatar_id, topic, age, country, is_verified)")
+      .eq("recipient_id", uid)
+      .eq("status", "pending");
     setIncomingRequests(incoming || []);
-    const { data: chats } = await supabase.from("friend_chats").select("*, a:user_a(id, username, avatar_id), b:user_b(id, username, avatar_id)").or(`user_a.eq.${uid},user_b.eq.${uid}`);
+    const { data: chats } = await supabase.from("friend_chats").select("*, a:user_a(id, username, avatar_id, is_verified), b:user_b(id, username, avatar_id, is_verified)").or(`user_a.eq.${uid},user_b.eq.${uid}`);
     setFriendsList((chats || []).map((c) => ({ chatId: c.id, partner: c.user_a === uid ? c.b : c.a })));
   }
 
@@ -370,7 +422,7 @@ export default function Home() {
   async function searchUsers() {
     const q = friendSearch.trim();
     if (!q) { setFriendResults([]); return; }
-    const { data } = await supabase.from("profiles").select("id, username, avatar_id").ilike("username", `%${q}%`).neq("id", uid).limit(10);
+    const { data } = await supabase.from("profiles").select("id, username, avatar_id, is_verified").ilike("username", `%${q}%`).neq("id", uid).limit(10);
     setFriendResults(data || []);
   }
   async function sendRequestTo(recipientId) {
@@ -423,6 +475,12 @@ export default function Home() {
     if (error) setAdminError("Couldn't find that username, or something went wrong.");
     else setAdminPremiumUsername("");
   }
+  async function setVerified(verified) {
+    setAdminError("");
+    const { error } = await supabase.rpc("admin_set_verified", { p_username: adminVerifiedUsername, p_verified: verified });
+    if (error) setAdminError("Couldn't find that username, or something went wrong.");
+    else setAdminVerifiedUsername("");
+  }
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
@@ -451,7 +509,7 @@ export default function Home() {
             </div>
 
             {homeTab === "find" && (
-              <>
+              <div className="relative">
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
                     {profile && <Avatar id={profile.avatar_id} size={38} />}
@@ -466,7 +524,7 @@ export default function Home() {
 
                 {settings.show_online_count && <p className="text-[11px] font-mono mt-2 text-[#5EEAD4]">● {settings.online_count_override.toLocaleString()} online now</p>}
 
-                {!profile && (
+                {!profile ? (
                   <div className="mt-5 flex flex-col gap-3">
                     <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="Pick a username" className="rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none" />
                     <div className="flex gap-2">
@@ -479,20 +537,17 @@ export default function Home() {
                         <button key={c.code} onClick={() => setCountry(c.code)} className="shrink-0 rounded-full px-2.5 py-1.5 text-xs" style={{ background: country === c.code ? "#1E3D38" : "#232532", color: country === c.code ? "#5EEAD4" : "#8C8FA3" }}>{c.flag} {c.code}</button>
                       ))}
                     </div>
-                    <p className="text-[10px] font-mono text-[#5C5F70]">Your avatar will be picked for you — you can change it later.</p>
+                  </div>
+                ) : (
+                  <div className="mt-4">
+                    <input value={topic} onChange={(e) => setTopic(e.target.value.slice(0, 60))} placeholder="What do you want to talk about?" className="w-full rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none" />
+                    <div className="flex gap-1.5 overflow-x-auto mt-1.5 pb-1">
+                      {TOPIC_EXAMPLES.slice(0, 4).map((t) => <button key={t} onClick={() => setTopic(t)} className="shrink-0 rounded-full px-2.5 py-1 text-[10px] whitespace-nowrap bg-[#232532] text-[#5C5F70]">{t}</button>)}
+                    </div>
                   </div>
                 )}
 
                 <div className="mt-4">
-                  <p className="text-xs font-mono text-[#8C8FA3] mb-1.5">TOPIC / MOOD</p>
-                  <input value={topic} onChange={(e) => setTopic(e.target.value.slice(0, 60))} placeholder="What do you want to talk about?" className="w-full rounded-lg px-3 py-2.5 bg-[#232532] text-sm outline-none" />
-                  <div className="flex gap-1.5 overflow-x-auto mt-1.5 pb-1">
-                    {TOPIC_EXAMPLES.map((t) => <button key={t} onClick={() => setTopic(t)} className="shrink-0 rounded-full px-2.5 py-1 text-[10px] whitespace-nowrap bg-[#232532] text-[#5C5F70]">{t}</button>)}
-                  </div>
-                </div>
-
-                <div className="mt-4">
-                  <p className="text-xs font-mono text-[#8C8FA3] mb-1.5">MATCH WITH</p>
                   <div className="grid grid-cols-3 gap-2">
                     {["any", "male", "female"].map((g) => {
                       const locked = g !== "any" && restrictedFromGender;
@@ -506,34 +561,21 @@ export default function Home() {
                   </div>
                 </div>
 
-                <div className="mt-3">
-                  <div className="flex items-center justify-between mb-1.5">
-                    <p className="text-xs font-mono text-[#8C8FA3]">AGE RANGE</p>
-                    {!isPremiumActive && <span className="text-[10px] font-mono text-[#FFD400]">👑 Premium</span>}
-                  </div>
-                  <div className="grid grid-cols-4 gap-1.5">
-                    {AGE_RANGES.map((r) => (
-                      <button key={r} onClick={() => isPremiumActive && setAgeFilter((f) => (f === r ? "any" : r))} className="rounded-lg py-2 text-[11px] font-mono" style={{ background: ageFilter === r ? "#1E3D38" : "#232532", color: ageFilter === r ? "#5EEAD4" : "#8C8FA3", opacity: isPremiumActive ? 1 : 0.5 }}>{r}</button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="mt-3">
-                  <div className="flex items-center justify-between mb-1.5">
-                    <p className="text-xs font-mono text-[#8C8FA3]">COUNTRY</p>
-                    {!isPremiumActive && <span className="text-[10px] font-mono text-[#FFD400]">👑 Premium</span>}
-                  </div>
-                  <div className="flex gap-1.5 overflow-x-auto pb-1">
-                    {COUNTRIES.map((c) => (
-                      <button key={c.code} onClick={() => isPremiumActive && setCountryFilter((f) => (f === c.code ? "any" : c.code))} className="shrink-0 rounded-full px-2.5 py-1.5 text-xs" style={{ background: countryFilter === c.code ? "#1E3D38" : "#232532", color: countryFilter === c.code ? "#5EEAD4" : "#8C8FA3", opacity: isPremiumActive ? 1 : 0.5 }}>{c.flag} {c.code}</button>
-                    ))}
-                  </div>
-                </div>
-
                 {error && <p className="text-xs font-mono text-[#FF5C5C] mt-3">{error}</p>}
 
                 <button onClick={createProfileAndMatch} className="w-full mt-5 rounded-xl py-3.5 font-display bg-[#FF3D7F] text-[#1A0810]">Start matching</button>
-              </>
+
+                {lastPartner && (
+                  <button onClick={rewindToLast} className="w-full mt-2 rounded-xl py-2.5 text-sm flex items-center justify-center gap-1.5 bg-[#232532]" style={{ color: isPremiumActive ? "#F0F0EE" : "#5C5F70" }}>
+                    ↺ Rewind to {lastPartner.username} {!isPremiumActive && "👑"}
+                  </button>
+                )}
+
+                <button onClick={() => setShowPrefs(true)} className="fixed rounded-full p-3.5 z-10" style={{ right: 28, bottom: 84, background: "#FFD400", boxShadow: "0 0 18px #FFD40088" }}>
+                  <span style={{ color: "#2A2005", fontSize: 16 }}>⚙</span>
+                </button>
+                {showPrefs && <PreferencesSheet ageFilter={ageFilter} setAgeFilter={setAgeFilter} countryFilter={countryFilter} setCountryFilter={setCountryFilter} isPremiumActive={isPremiumActive} onClose={() => setShowPrefs(false)} />}
+              </div>
             )}
 
             {homeTab === "friends" && (
@@ -550,7 +592,7 @@ export default function Home() {
                       <div className="mt-3 flex flex-col gap-1.5">
                         {friendResults.map((u) => (
                           <div key={u.id} className="flex items-center justify-between rounded-lg px-3 py-2 bg-[#232532]">
-                            <span className="flex items-center gap-2 text-sm"><Avatar id={u.avatar_id} size={26} /> {u.username}</span>
+                            <span className="flex items-center gap-2 text-sm"><Avatar id={u.avatar_id} size={26} /> {u.username} {u.is_verified && "✅"}</span>
                             <button onClick={() => sendRequestTo(u.id)} className="text-xs font-mono text-[#5EEAD4]">Add friend</button>
                           </div>
                         ))}
@@ -561,12 +603,21 @@ export default function Home() {
                         <p className="text-[10px] font-mono text-[#5C5F70] mb-1.5">FRIEND REQUESTS</p>
                         <div className="flex flex-col gap-1.5">
                           {incomingRequests.map((r) => (
-                            <div key={r.id} className="flex items-center justify-between rounded-lg px-3 py-2 bg-[#232532]">
-                              <span className="flex items-center gap-2 text-sm"><Avatar id={r.requester?.avatar_id} size={26} /> {r.requester?.username}</span>
-                              <div className="flex gap-2">
-                                <button onClick={() => respondRequest(r.id, false)} className="text-xs font-mono text-[#5C5F70]">Decline</button>
-                                <button onClick={() => respondRequest(r.id, true)} className="text-xs font-mono text-[#5EEAD4]">Accept</button>
+                            <div key={r.id} className="rounded-lg px-3 py-2 bg-[#232532]">
+                              <div className="flex items-center justify-between">
+                                <span className="flex items-center gap-2 text-sm"><Avatar id={r.requester?.avatar_id} size={26} /> {r.requester?.username} {r.requester?.is_verified && "✅"}</span>
+                                <div className="flex gap-2">
+                                  <button onClick={() => respondRequest(r.id, false)} className="text-xs font-mono text-[#5C5F70]">Decline</button>
+                                  <button onClick={() => respondRequest(r.id, true)} className="text-xs font-mono text-[#5EEAD4]">Accept</button>
+                                </div>
                               </div>
+                              {isPremiumActive ? (
+                                <p className="text-[10px] font-mono mt-1.5 text-[#8C8FA3]">
+                                  {r.requester?.age ? `${r.requester.age} · ` : ""}{r.requester?.country ? `${flagFor(r.requester.country)} · ` : ""}{r.requester?.topic || "no topic set"}
+                                </p>
+                              ) : (
+                                <p className="text-[10px] font-mono mt-1.5 text-[#FFD400]">👑 Premium previews their profile before you decide</p>
+                              )}
                             </div>
                           ))}
                         </div>
@@ -579,7 +630,7 @@ export default function Home() {
                       <div className="flex flex-col gap-1.5">
                         {friendsList.map((f) => (
                           <button key={f.chatId} onClick={() => openFriendChat(f.chatId, f.partner)} className="flex items-center justify-between rounded-lg px-3 py-2.5 bg-[#232532]">
-                            <span className="flex items-center gap-2 text-sm"><Avatar id={f.partner?.avatar_id} size={28} /> {f.partner?.username}</span>
+                            <span className="flex items-center gap-2 text-sm"><Avatar id={f.partner?.avatar_id} size={28} /> {f.partner?.username} {f.partner?.is_verified && "✅"}</span>
                             <span className="text-[10px] font-mono text-[#5EEAD4]">Chat</span>
                           </button>
                         ))}
@@ -607,7 +658,7 @@ export default function Home() {
               <div className="flex items-center gap-2">
                 <button onClick={requestGoHome} className="p-2 rounded-lg bg-[#232532] text-xs">home</button>
                 <Avatar id={partner.avatar_id} size={32} />
-                <p className="font-display text-sm">{partner.username} {flagFor(partner.country)}</p>
+                <p className="font-display text-sm">{partner.username} {partner.is_verified && "✅"} {flagFor(partner.country)}</p>
               </div>
               <div className="flex items-center gap-2">
                 <button onClick={addFriendFromMatch} disabled={!!matchFriendStatus} className="p-2 rounded-lg bg-[#232532] text-xs">
@@ -661,7 +712,7 @@ export default function Home() {
             <div className="px-5 py-3 flex items-center gap-2 border-b border-[#2E3140]">
               <button onClick={goHome} className="p-2 rounded-lg bg-[#232532] text-xs">home</button>
               <Avatar id={friendPartner.avatar_id} size={32} />
-              <p className="font-display text-sm">{friendPartner.username}</p>
+              <p className="font-display text-sm">{friendPartner.username} {friendPartner.is_verified && "✅"}</p>
             </div>
             <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-2">
               {friendMessages.map((m) => <div key={m.id} className={`max-w-[75%] px-3 py-2 rounded-2xl text-sm ${m.sender_id === uid ? "self-end bg-[#FF3D7F] text-[#1A0810]" : "self-start bg-[#232532]"}`}>{m.body}</div>)}
@@ -796,9 +847,16 @@ export default function Home() {
               <input type="number" value={adminPremiumDays} onChange={(e) => setAdminPremiumDays(parseInt(e.target.value) || 0)} className="w-16 bg-[#232532] rounded px-2 py-1 text-xs" />
               <span className="text-xs text-[#8C8FA3]">days</span>
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 mb-5">
               <button onClick={() => grantPremium(true)} className="flex-1 rounded-lg py-2.5 text-sm font-display bg-[#3D3320] text-[#FFD400]">Grant Premium</button>
               <button onClick={() => grantPremium(false)} className="flex-1 rounded-lg py-2.5 text-sm font-display bg-[#232532] text-[#8C8FA3]">Revoke</button>
+            </div>
+
+            <p className="text-xs font-mono text-[#5C5F70] mb-2">VERIFIED BADGE</p>
+            <input value={adminVerifiedUsername} onChange={(e) => setAdminVerifiedUsername(e.target.value)} placeholder="Username" className="w-full rounded-lg px-3 py-2 bg-[#232532] text-sm outline-none mb-2" />
+            <div className="flex gap-2">
+              <button onClick={() => setVerified(true)} className="flex-1 rounded-lg py-2.5 text-sm font-display bg-[#1E3D38] text-[#5EEAD4]">Grant Verified</button>
+              <button onClick={() => setVerified(false)} className="flex-1 rounded-lg py-2.5 text-sm font-display bg-[#232532] text-[#8C8FA3]">Revoke</button>
             </div>
           </div>
         )}
