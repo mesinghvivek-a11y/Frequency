@@ -52,7 +52,6 @@ const TOPIC_EXAMPLES = [
   "Into astrology — what's your sign?", "Just moved to a new city, give me tips",
 ];
 
-// --- Waiting-room mini game -------------------------------------------
 function MiniGame() {
   const [score, setScore] = useState(0); const [best, setBest] = useState(0);
   const [alive, setAlive] = useState(true); const [started, setStarted] = useState(false);
@@ -120,7 +119,6 @@ function MiniGame() {
   );
 }
 
-// --- Preferences sheet (Premium-gated age/country filters) -------------
 function PreferencesSheet({ ageFilter, setAgeFilter, countryFilter, setCountryFilter, isPremiumActive, onClose }) {
   return (
     <div className="absolute inset-0 z-30 flex items-end justify-center" style={{ background: "rgba(0,0,0,0.6)" }} onClick={onClose}>
@@ -160,7 +158,6 @@ export default function Home() {
   const [showSettings, setShowSettings] = useState(false);
   const [showPrefs, setShowPrefs] = useState(false);
 
-  // signup form
   const [username, setUsername] = useState("");
   const [gender, setGender] = useState("male");
   const [age, setAge] = useState("");
@@ -170,7 +167,6 @@ export default function Home() {
   const [countryFilter, setCountryFilter] = useState("any");
   const [topic, setTopic] = useState("");
 
-  // random-match chat
   const [sessionId, setSessionId] = useState(null);
   const [partner, setPartner] = useState(null);
   const [lastPartner, setLastPartner] = useState(null);
@@ -188,7 +184,6 @@ export default function Home() {
   const [showHomeConfirm, setShowHomeConfirm] = useState(false);
   const messagesEndRef = useRef(null);
 
-  // friends
   const [friendSearch, setFriendSearch] = useState("");
   const [friendResults, setFriendResults] = useState([]);
   const [incomingRequests, setIncomingRequests] = useState([]);
@@ -199,7 +194,6 @@ export default function Home() {
   const [friendDraft, setFriendDraft] = useState("");
   const friendMessagesEndRef = useRef(null);
 
-  // owner dashboard
   const [showAdmin, setShowAdmin] = useState(false);
   const [adminStats, setAdminStats] = useState(null);
   const [adminError, setAdminError] = useState("");
